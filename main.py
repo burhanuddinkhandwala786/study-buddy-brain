@@ -104,7 +104,6 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
                 "response_mime_type": "application/json",
                 "temperature": 0.0,
             }
-            # Only pass thinking_config on non-lite 2.5 models
             if "2.5" in model_name and "lite" not in model_name:
                 cfg_kwargs["thinking_config"] = types.ThinkingConfig(
                     thinking_budget=512 if deep_think else 0
@@ -117,7 +116,6 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
                     config=types.GenerateContentConfig(**cfg_kwargs),
                 )
             except Exception as inner_e:
-                # Retry cleanly without thinking_config if rejected
                 if "thinking_config" in cfg_kwargs:
                     cfg_kwargs.pop("thinking_config", None)
                     response = client.models.generate_content(
