@@ -3,8 +3,6 @@ import json
 import base64
 import time
 import hashlib
-from io import BytesIO
-from PIL import Image
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -27,11 +25,12 @@ RESULT_CACHE = {}
 CACHE_TTL = 600
 COOLDOWN_SECS = 65
 
+# Flash-Lite first: 3x faster inference + higher free-tier RPM quota (avoids slow 429 retry loops)
 PREFERRED = [
-    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
     "gemini-flash-lite-latest",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
 ]
 BLOCKED_WORDS = [
     "embedding", "imagen", "veo", "aqa", "tts", "image",
@@ -62,7 +61,7 @@ def get_candidate_models(client):
         ordered = [m for m in PREFERRED if m in available]
         rest = sorted(
             [m for m in available if m not in ordered],
-            key=lambda n: ("flash" not in n, n),
+            key=lambda n: ("lite" not in n, "flash" not in n, n),
         )
         ordered += rest
     else:
@@ -98,13 +97,14 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
     if not ready:
         raise RuntimeError("Rate limited. Wait 60s and try again.")
 
-    budget = 1024 if deep_think else 0
+    budget = 512 if deep_think else 0
 
-    for model_name in ready[:8]:
+    for model_name in ready[:5]:
         try:
             cfg_kwargs = {
                 "response_mime_type": "application/json",
                 "temperature": 0.0,
+                "max_output_tokens": 900 if deep_think else 220,
             }
             if "2.5" in model_name or "flash" in model_name:
                 cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=budget)
@@ -174,26 +174,13 @@ def error_response(msg: str, detail: str = ""):
     }
 
 
-PROMPT = """
-You are an enterprise-grade, ultra-precise study and engineering intelligence. Read the ENTIRE visible screen or text carefully—including mark badges (like "+5 Marks", "10 Marks"), equations, circuit diagrams, sub-criteria, or MCQ options—before answering. Return valid JSON with keys:
-- "detected_type": "MCQ" | "DIRECT_VALUE" | "CODE_FIX" | "UI_GUIDE" | "LONG_ANSWER" | "CONCEPT_EXPLAIN"
-- "cursor_pill": Short headline displayed on the cursor tip:
-  * If MCQ: ONLY the exact option letter and text (e.g., "B) Half-wave dipole"). Zero explanation.
-  * If Numerical / Fill-in-blank: ONLY the exact final verified value/unit.
-  * If Code error: ONLY the corrected line of code.
-  * If UI/Software screen asking how/where to do something: 1-line instruction (e.g., "Click Export -> PDF").
-  * If LONG_ANSWER (any question showing marks >= 3, "Differentiate", "Compare", "Derive", "Explain", or a follow-up question): Crisp 1-line headline summary.
-  * If CONCEPT_EXPLAIN (short 1-2 mark definition): 1 crisp sentence definition.
-- "copy_value":
-  * For LONG_ANSWER: Complete, well-structured answer covering EVERY parameter requested, scaled to the marks (5-6 detailed points for 5 marks).
-  * For DIRECT_VALUE / CODE_FIX: Clean raw value/code.
-  * For MCQ: "".
-- "expanded_note":
-  * For LONG_ANSWER: Same complete structured multi-point answer as copy_value.
-  * For CONCEPT_EXPLAIN / UI_GUIDE: Concise 3-bullet breakdown.
-  * Otherwise "".
-- "pointer_xy": If UI_GUIDE and a specific button/icon is visible, return [x, y] normalized 0-1000; otherwise null.
-"""
+PROMPT = """Return valid JSON only:
+{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
+Rules:
+- MCQ: cursor_pill = exact option number/letter + text (e.g. "2. Stratified"). copy_value="", expanded_note="".
+- DIRECT_VALUE / CODE_FIX: cursor_pill = exact answer/fixed line; copy_value = same raw value; expanded_note="".
+- LONG_ANSWER (marks >= 3, Differentiate, Compare, Derive, Explain in detail, or follow-up): cursor_pill = short title; copy_value & expanded_note = complete structured multi-point answer covering every requested parameter.
+- CONCEPT_EXPLAIN / UI_GUIDE: cursor_pill = 1-line summary; expanded_note = 3 crisp bullets; pointer_xy = [x,y] 0-1000 if UI button visible else null."""
 
 
 @app.post("/analyze")
@@ -208,20 +195,20 @@ def analyze_context(req: AnalyzeRequest):
         deep_think = bool(req.follow_up)
 
         if req.follow_up and req.prior_context:
-            contents.append(f"Previous answer context:\n{req.prior_context}\n\nUser follow-up question:\n{req.follow_up}")
+            contents.append(f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}")
             key = hashlib.md5((req.prior_context + req.follow_up).encode()).hexdigest()
         elif req.image_base64:
             clean_b64 = req.image_base64.split(",")[-1]
             key = hashlib.md5(clean_b64.encode()).hexdigest()
-            img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-            img.thumbnail((960, 960))
-            contents.append(img)
+            # Pass JPEG bytes directly without slow PIL decode/re-encode on server CPU
+            img_bytes = base64.b64decode(clean_b64)
+            contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
         elif req.text_content:
             key = hashlib.md5(req.text_content.encode()).hexdigest()
             low_t = req.text_content.lower()
             if any(w in low_t for w in ["differentiate", "derive", "explain", "compare", "marks", "circuit", "calculate"]):
                 deep_think = True
-            contents.append(f"Selected text:\n{req.text_content}")
+            contents.append(f"Text:\n{req.text_content}")
         else:
             return error_response("Empty input")
 
