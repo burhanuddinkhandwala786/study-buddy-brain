@@ -1,210 +1,247 @@
 import os
-import re
 import json
 import base64
 import time
 import hashlib
 from io import BytesIO
-from typing import Optional, Literal
-
-import httpx
 from PIL import Image
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 from google import genai
 from google.genai import types
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-MAX_IMG_SIDE = 1280
+WORKING_MODEL = None
+_CANDIDATES = {"models": [], "ts": 0}
+COOLDOWN = {}
 RESULT_CACHE = {}
 CACHE_TTL = 600
+COOLDOWN_SECS = 65
 
-SYSTEM = """You are an expert academic tutor and engineering assistant. Solve the problem accurately.
-You must return valid JSON only, with exactly these keys:
-{
-  "transcription": "Exact transcription of the problem text/equations from the image or input",
-  "reasoning": "Step-by-step logical derivation or verification",
-  "detected_type": "MCQ" or "DIRECT_VALUE" or "CODE_FIX" or "UI_GUIDE" or "LONG_ANSWER" or "CONCEPT_EXPLAIN",
-  "final_answer": "The concise answer shown on the cursor pill (e.g. '2. Stratified' for MCQ or the exact result)",
-  "copy_value": "Value to copy to clipboard (if applicable)",
-  "expanded_note": "Detailed breakdown, notes, or steps for long answers",
-  "confidence": integer between 0 and 100
-}"""
+# Updated to stable, currently supported model IDs to prevent 404 errors
+PREFERRED = [
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+    "gemini-flash",
+]
+BLOCKED_WORDS = [
+    "embedding", "imagen", "veo", "aqa", "tts", "image",
+    "live", "audio", "robotics", "computer-use", "learnlm", "gemma"
+]
+
+
+def get_candidate_models(client):
+    if _CANDIDATES["models"] and time.time() - _CANDIDATES["ts"] < 3600:
+        return _CANDIDATES["models"]
+
+    available = []
+    try:
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            name = (m.name or "").replace("models/", "")
+            low = name.lower()
+            if (
+                "generateContent" in actions
+                and low.startswith("gemini")
+                and not any(x in low for x in BLOCKED_WORDS)
+            ):
+                available.append(name)
+    except Exception:
+        pass
+
+    if available:
+        ordered = [m for m in PREFERRED if m in available]
+        rest = sorted(
+            [m for m in available if m not in ordered],
+            key=lambda n: ("flash" not in n, n),
+        )
+        ordered += rest
+    else:
+        ordered = list(PREFERRED)
+
+    _CANDIDATES["models"] = ordered
+    _CANDIDATES["ts"] = time.time()
+    return ordered
+
+
+def is_model_problem(err_str: str) -> bool:
+    s = err_str.lower()
+    return any(
+        k in s
+        for k in [
+            "404", "not_found", "not found", "no longer available",
+            "deprecated", "is not supported", "429", "resource_exhausted",
+            "503", "unavailable", "overloaded", "invalid_argument", "timeout", "deadline"
+        ]
+    )
+
+
+def call_gemini_with_fallback(client, contents, deep_think: bool = False):
+    global WORKING_MODEL
+    models_to_try = []
+
+    if deep_think:
+        for m in ["gemini-2.5-flash", "gemini-1.5-flash"]:
+            if m in get_candidate_models(client):
+                models_to_try.append(m)
+    elif WORKING_MODEL:
+        models_to_try.append(WORKING_MODEL)
+
+    for m in get_candidate_models(client):
+        if m not in models_to_try:
+            models_to_try.append(m)
+
+    last_err = None
+    now = time.time()
+    ready = [m for m in models_to_try if COOLDOWN.get(m, 0) <= now]
+    if not ready:
+        raise RuntimeError("Rate limited. Wait 60s and try again.")
+
+    for model_name in ready[:4]:
+        try:
+            cfg_kwargs = {
+                "response_mime_type": "application/json",
+                "temperature": 0.0,
+                "max_output_tokens": 1024,
+            }
+            if "2.5" in model_name:
+                cfg_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_budget=512 if deep_think else 0
+                )
+
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**cfg_kwargs),
+                )
+            except Exception as inner_e:
+                if "thinking_config" in cfg_kwargs:
+                    cfg_kwargs.pop("thinking_config", None)
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(**cfg_kwargs),
+                    )
+                else:
+                    raise inner_e
+
+            if not deep_think:
+                WORKING_MODEL = model_name
+            return response.text
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                COOLDOWN[model_name] = time.time() + COOLDOWN_SECS
+            if is_model_problem(err_str):
+                if model_name == WORKING_MODEL:
+                    WORKING_MODEL = None
+                continue
+            raise
+
+    _CANDIDATES["ts"] = 0
+    raise RuntimeError(f"All models failed: {last_err}")
+
 
 class AnalyzeRequest(BaseModel):
     image_base64: Optional[str] = None
     text_content: Optional[str] = None
     follow_up: Optional[str] = None
     prior_context: Optional[str] = None
-    mode: Literal["fast", "accurate"] = "accurate"
 
-def parse_json(txt):
-    if not txt:
-        raise ValueError("Empty response from model")
-    cleaned = re.sub(r"^```json\s*", "", txt.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"^```\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    
-    m = re.search(r"\{.*\}", cleaned, re.S)
-    if not m:
-        raise ValueError(f"No JSON object found in response: {txt[:200]}")
-    
-    d = json.loads(m.group(0))
-    d.setdefault("transcription", "")
-    d.setdefault("reasoning", "")
-    d.setdefault("detected_type", "DIRECT_VALUE")
-    d.setdefault("final_answer", "Solution ready")
-    d.setdefault("copy_value", "")
-    d.setdefault("expanded_note", "")
-    try:
-        d["confidence"] = int(d.get("confidence", 85))
-    except Exception:
-        d["confidence"] = 85
-    return d
-
-def call_gemini(user_text, img=None):
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("Missing GEMINI_API_KEY")
-    
-    client = genai.Client(api_key=key)
-    contents = [SYSTEM, user_text]
-    if img is not None:
-        contents.append(img)
-        
-    # Use standard stable Gemini 2.5 Flash model
-    models_to_try = ["gemini-2.5-flash"]
-    last_err = None
-    
-    for model in models_to_try:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                    max_output_tokens=4096
-                )
-            )
-            return parse_json(response.text)
-        except Exception as e:
-            last_err = e
-            continue
-            
-    raise RuntimeError(f"Gemini failed: {str(last_err)}")
-
-def call_groq(user_text):
-    key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("Missing GROQ_API_KEY")
-    
-    body = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": user_text}
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.0,
-        "max_tokens": 4096
-    }
-    
-    with httpx.Client(timeout=30.0) as client:
-        res = client.post(
-            "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
-            headers={"Authorization": f"Bearer {key}"},
-            json=body
-        )
-        if res.status_code != 200:
-            raise RuntimeError(f"Groq error {res.status_code}: {res.text[:150]}")
-        return parse_json(res.json()["choices"][0]["message"]["content"])
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
-    return {
-        "status": "ok",
-        "gemini": bool(os.environ.get("GEMINI_API_KEY")),
-        "groq": bool(os.environ.get("GROQ_API_KEY")),
-    }
+    return {"status": "ok", "cached_working_model": WORKING_MODEL}
 
-def error_response(msg, detail=""):
+
+@app.get("/models")
+def list_models():
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {"error": "GEMINI_API_KEY not set"}
+    client = genai.Client(api_key=api_key)
+    return {"candidates": get_candidate_models(client)}
+
+
+def error_response(msg: str, detail: str = ""):
     return {
         "detected_type": "ERROR",
         "cursor_pill": msg,
         "copy_value": "",
         "expanded_note": detail,
         "pointer_xy": None,
-        "confidence": 0,
-        "status": "error"
     }
 
-@app.post("/analyze")
-def analyze(req: AnalyzeRequest):
-    if not os.environ.get("GEMINI_API_KEY", "").strip():
-        return error_response("Set GEMINI_API_KEY in Render environment")
-        
-    try:
-        img = None
-        if req.follow_up and req.prior_context:
-            text_in = f"Earlier context:\n{req.prior_context}\n\nFollow-up question:\n{req.follow_up}"
-            raw_key = req.prior_context + req.follow_up
-        elif req.image_base64:
-            raw_b64 = req.image_base64.split(",")[-1]
-            raw = base64.b64decode(raw_b64)
-            img = Image.open(BytesIO(raw)).convert("RGB")
-            if max(img.size) > MAX_IMG_SIDE:
-                img.thumbnail((MAX_IMG_SIDE, MAX_IMG_SIDE), Image.LANCZOS)
-            text_in = "Analyze and solve the problem shown in this image accurately."
-            raw_key = raw_b64[:100]
-        elif req.text_content:
-            text_in = f"Solve this:\n{req.text_content}"
-            raw_key = req.text_content
-        else:
-            return error_response("Empty input received")
 
-        key = hashlib.md5((req.mode + raw_key).encode()).hexdigest()
+PROMPT = """Analyze the image or text with rigorous academic accuracy. Verify formulas, option numbers, and logical constraints step-by-step before answering. Return valid JSON only:
+{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
+Rules:
+- MCQ: cursor_pill = exact option letter/number + text (e.g. "2. Stratified"). copy_value="", expanded_note="".
+- DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer/fixed line; copy_value = same raw value; expanded_note="".
+- LONG_ANSWER (marks >= 3, derivations, proofs, code logic, or comparisons): cursor_pill = short title; copy_value & expanded_note = rigorous, complete multi-point breakdown.
+- CONCEPT_EXPLAIN / UI_GUIDE: cursor_pill = 1-line summary; expanded_note = 3 high-yield bullet points."""
+
+
+@app.post("/analyze")
+def analyze_context(req: AnalyzeRequest):
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return error_response("Set GEMINI_API_KEY in Render")
+
+    try:
+        client = genai.Client(api_key=api_key)
+        contents = [PROMPT]
+        deep_think = bool(req.follow_up)
+
+        if req.follow_up and req.prior_context:
+            contents.append(f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}")
+            key = hashlib.md5((req.prior_context + req.follow_up).encode()).hexdigest()
+        elif req.image_base64:
+            clean_b64 = req.image_base64.split(",")[-1]
+            key = hashlib.md5(clean_b64.encode()).hexdigest()
+            img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
+            img.thumbnail((560, 560))
+            contents.append(img)
+        elif req.text_content:
+            key = hashlib.md5(req.text_content.encode()).hexdigest()
+            low_t = req.text_content.lower()
+            if any(w in low_t for w in ["differentiate", "derive", "explain", "compare", "marks", "circuit", "calculate"]):
+                deep_think = True
+            contents.append(f"Text:\n{req.text_content}")
+        else:
+            return error_response("Empty input")
+
         hit = RESULT_CACHE.get(key)
         if hit and time.time() - hit[0] < CACHE_TTL:
             return hit[1]
 
-        sol = None
-        status = "single"
-        
-        # Try Gemini first, fallback to Groq if needed
-        try:
-            sol = call_gemini(text_in, img)
-        except Exception as gemini_err:
-            try:
-                sol = call_groq(text_in)
-                status = "fallback-groq"
-            except Exception as groq_err:
-                return error_response(f"Err: Gemini & Groq failed", f"Gemini: {str(gemini_err)} | Groq: {str(groq_err)}")
-
-        conf = sol.get("confidence", 85)
-        pill = sol.get("final_answer", "Done")
-        if conf >= 90:
-            pill = "✓ " + pill
-        elif conf < 60:
-            pill = "⚠ " + pill
-
-        data = {
-            "detected_type": sol.get("detected_type", "DIRECT_VALUE"),
-            "cursor_pill": pill,
-            "copy_value": sol.get("copy_value", ""),
-            "expanded_note": sol.get("expanded_note", sol.get("reasoning", "")),
-            "pointer_xy": None,
-            "confidence": conf,
-            "status": status,
-        }
+        raw_json = call_gemini_with_fallback(client, contents, deep_think=deep_think)
+        cleaned = (
+            raw_json.strip()
+            .removeprefix("```json")
+            .removeprefix("```")
+            .removesuffix("```")
+            .strip()
+        )
+        data = json.loads(cleaned)
+        if isinstance(data, list) and data:
+            data = data[0]
 
         RESULT_CACHE[key] = (time.time(), data)
         if len(RESULT_CACHE) > 200:
             RESULT_CACHE.pop(next(iter(RESULT_CACHE)))
-        return data
 
+        return data
     except Exception as e:
         return error_response(f"Err: {str(e)[:55]}", str(e))
