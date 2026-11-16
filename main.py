@@ -28,10 +28,10 @@ CACHE_TTL = 600
 COOLDOWN_SECS = 65
 
 PREFERRED = [
-    "gemini-2.5-flash-lite",
-    "gemini-flash-lite-latest",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-flash-latest",
+    "gemini-flash-lite-latest",
 ]
 BLOCKED_WORDS = [
     "embedding", "imagen", "veo", "aqa", "tts", "image",
@@ -62,7 +62,7 @@ def get_candidate_models(client):
         ordered = [m for m in PREFERRED if m in available]
         rest = sorted(
             [m for m in available if m not in ordered],
-            key=lambda n: ("lite" not in n, "flash" not in n, n),
+            key=lambda n: ("flash" not in n, n),
         )
         ordered += rest
     else:
@@ -80,7 +80,7 @@ def is_model_problem(err_str: str) -> bool:
         for k in [
             "404", "not_found", "not found", "no longer available",
             "deprecated", "is not supported", "429", "resource_exhausted",
-            "503", "unavailable", "overloaded", "invalid_argument"
+            "503", "unavailable", "overloaded", "invalid_argument", "timeout", "deadline"
         ]
     )
 
@@ -103,6 +103,7 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
             cfg_kwargs = {
                 "response_mime_type": "application/json",
                 "temperature": 0.0,
+                "http_options": {"timeout": 8000},
             }
             if "2.5" in model_name and "lite" not in model_name:
                 cfg_kwargs["thinking_config"] = types.ThinkingConfig(
@@ -177,7 +178,7 @@ def error_response(msg: str, detail: str = ""):
 PROMPT = """Return valid JSON only:
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
 Rules:
-- MCQ: cursor_pill = exact option number/letter + text (e.g. "2. Stratified"). copy_value="", expanded_note="".
+- MCQ: cursor_pill = exact option number/letter + text (e.g. "1. Both A and R are correct..."). copy_value="", expanded_note="".
 - DIRECT_VALUE / CODE_FIX: cursor_pill = exact answer/fixed line; copy_value = same raw value; expanded_note="".
 - LONG_ANSWER (marks >= 3, Differentiate, Compare, Derive, Explain in detail, or follow-up): cursor_pill = short title; copy_value & expanded_note = complete structured multi-point answer covering every requested parameter.
 - CONCEPT_EXPLAIN / UI_GUIDE: cursor_pill = 1-line summary; expanded_note = 3 crisp bullets; pointer_xy = [x,y] 0-1000 if UI button visible else null."""
@@ -201,7 +202,7 @@ def analyze_context(req: AnalyzeRequest):
             clean_b64 = req.image_base64.split(",")[-1]
             key = hashlib.md5(clean_b64.encode()).hexdigest()
             img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-            img.thumbnail((820, 820))
+            img.thumbnail((600, 600))
             contents.append(img)
         elif req.text_content:
             key = hashlib.md5(req.text_content.encode()).hexdigest()
