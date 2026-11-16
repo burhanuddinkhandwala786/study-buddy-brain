@@ -123,7 +123,7 @@ def call_groq(prompt_text: str, image_b64: Optional[str] = None) -> str:
 
     res = _HTTP_CLIENT.post(
         "https://api.groq.com/openai/v1/chat/completions",
-        json={"model": model_id, "messages": messages, "temperature": 0.0, "max_tokens": 1200},
+        json={"model": model_id, "messages": messages, "temperature": 0.0, "max_tokens": 600},
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
     if res.status_code != 200:
@@ -150,9 +150,13 @@ def analyze_context(req: AnalyzeRequest):
             raw_key = hashlib.md5(clean_b64.encode()).hexdigest()
             img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
             img_pil.thumbnail((640, 640), Image.BILINEAR)
+
+            groq_img = img_pil.copy()
+            groq_img.thumbnail((448, 448), Image.BILINEAR)
             buf = BytesIO()
-            img_pil.save(buf, format="JPEG", quality=78)
+            groq_img.save(buf, format="JPEG", quality=65)
             img_b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+
             contents_text = "Solve the problem shown in this image accurately."
         elif req.text_content:
             contents_text = f"Solve:\n{req.text_content}"
