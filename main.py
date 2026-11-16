@@ -18,13 +18,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+CACHED_MODEL = None
+
+def get_working_model(client):
+    global CACHED_MODEL
+    if CACHED_MODEL:
+        return CACHED_MODEL
+
+    available = []
+    for m in client.models.list():
+        actions = getattr(m, "supported_actions", []) or []
+        if "generateContent" in actions and "gemini" in m.name.lower():
+            # Strip 'models/' prefix if present
+            name = m.name.replace("models/", "")
+            if "embedding" not in name and "imagen" not in name and "veo" not in name:
+                available.append(name)
+
+    # Prefer Flash models first for speed, otherwise fall back to any available Gemini model
+    for preferred in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3-flash-preview", "gemini-1.5-flash"]:
+        for name in available:
+            if preferred in name:
+                CACHED_MODEL = name
+                return CACHED_MODEL
+
+    if available:
+        CACHED_MODEL = available[0]
+        return CACHED_MODEL
+
+    raise RuntimeError("No generateContent Gemini models available on this API key.")
+
 class AnalyzeRequest(BaseModel):
     image_base64: Optional[str] = None
     text_content: Optional[str] = None
 
 @app.get("/")
 def health():
-    return {"status": "ok"}
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {"status": "missing_key"}
+    client = genai.Client(api_key=api_key)
+    model = get_working_model(client)
+    return {"status": "ok", "active_model": model}
 
 @app.post("/analyze")
 def analyze_context(req: AnalyzeRequest):
@@ -40,6 +74,7 @@ def analyze_context(req: AnalyzeRequest):
 
     try:
         client = genai.Client(api_key=api_key)
+        model_name = get_working_model(client)
 
         prompt = """
         You are an ultra-fast, context-aware cursor intelligence. Analyze the input strictly by context and return valid JSON with keys:
@@ -48,7 +83,7 @@ def analyze_context(req: AnalyzeRequest):
           * If MCQ: ONLY the exact option letter and text (e.g., "B) Half-wave dipole"). Zero explanation.
           * If Numerical / Fill-in-blank: ONLY the exact final value/unit.
           * If Code error: ONLY the corrected line of code.
-          * If UI/Software screen asking how/where to do something: 1-line instruction (e.g., "Click Export → PDF").
+          * If UI/Software screen asking how/where to do something: 1-line instruction (e.g., "Click Export -> PDF").
           * If Open-ended theory/diagram: 1 crisp sentence core takeaway.
         - "copy_value": The clean raw value/code/answer to auto-copy to clipboard (empty string for MCQs).
         - "expanded_note": If CONCEPT_EXPLAIN or UI_GUIDE, give a concise 3-bullet step-by-step guide; otherwise "".
@@ -66,7 +101,7 @@ def analyze_context(req: AnalyzeRequest):
             return {"detected_type": "ERROR", "cursor_pill": "Empty input", "copy_value": "", "expanded_note": "", "pointer_xy": None}
 
         response = client.models.generate_content(
-            model="gemini-flash-latest",
+            model=model_name,
             contents=contents,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -77,7 +112,7 @@ def analyze_context(req: AnalyzeRequest):
     except Exception as e:
         return {
             "detected_type": "ERROR",
-            "cursor_pill": f"Err: {str(e)[:50]}",
+            "cursor_pill": f"Err: {str(e)[:55]}",
             "copy_value": "",
             "expanded_note": str(e),
             "pointer_xy": None
