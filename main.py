@@ -22,8 +22,8 @@ app.add_middleware(
 
 WORKING_MODEL = None
 _CANDIDATES = {"models": [], "ts": 0}
-COOLDOWN = {}       # model_name -> unix timestamp when cooldown ends
-RESULT_CACHE = {}   # md5_hash -> (timestamp, response_dict)
+COOLDOWN = {}
+RESULT_CACHE = {}
 CACHE_TTL = 600
 COOLDOWN_SECS = 65
 
@@ -114,7 +114,6 @@ def call_gemini_with_fallback(client, contents):
                     config=types.GenerateContentConfig(**cfg_kwargs),
                 )
             except Exception as inner_e:
-                # Fallback if specific model rejects thinking_config
                 if "thinking" in str(inner_e).lower():
                     cfg_kwargs.pop("thinking_config", None)
                     response = client.models.generate_content(
@@ -172,18 +171,24 @@ def error_response(msg: str, detail: str = ""):
 
 
 PROMPT = """
-You are an ultra-fast, high-precision cursor intelligence. Before answering, silently verify all facts, signs, units, and option letters against the exact text or diagram shown so there are zero careless errors. Return valid JSON with keys:
-- "detected_type": "MCQ" | "DIRECT_VALUE" | "CODE_FIX" | "UI_GUIDE" | "CONCEPT_EXPLAIN"
-- "cursor_pill": Ultra-short verified answer displayed directly on the user's cursor.
+You are an ultra-fast, high-precision study intelligence. Read the ENTIRE visible screen carefully—including mark badges (like "+5 Marks", "10 Marks"), sub-criteria (like "based on architecture, functionality, input/output, applications"), or MCQ options—before choosing the response format. Return valid JSON with keys:
+- "detected_type": "MCQ" | "DIRECT_VALUE" | "CODE_FIX" | "UI_GUIDE" | "LONG_ANSWER" | "CONCEPT_EXPLAIN"
+- "cursor_pill": Short headline displayed on the cursor tip:
   * If MCQ: ONLY the exact option letter and text (e.g., "B) Half-wave dipole"). Zero explanation.
   * If Numerical / Fill-in-blank: ONLY the exact final verified value/unit.
   * If Code error: ONLY the corrected line of code.
   * If UI/Software screen asking how/where to do something: 1-line instruction (e.g., "Click Export -> PDF").
-  * If Open-ended theory/diagram: 1 crisp sentence core takeaway.
-- "copy_value": The clean raw value/code/answer to auto-copy to clipboard (empty string for MCQs).
-- "expanded_note": If CONCEPT_EXPLAIN or UI_GUIDE, give a concise 3-bullet step-by-step guide; otherwise "".
-- "pointer_xy": If UI_GUIDE and a specific button/icon is visible in the image, return [x, y] normalized from 0 to 1000; otherwise null.
-If the screen contains several questions, answer the one closest to the center/cursor, or the first uncompleted one.
+  * If LONG_ANSWER (any question showing marks >= 3, "Differentiate", "Compare", "Explain", or listing multiple parameters): Crisp 1-line summary title (e.g., "LFSR vs MISR (5-Mark Breakdown)").
+  * If CONCEPT_EXPLAIN (short 1-2 mark definition): 1 crisp sentence definition.
+- "copy_value":
+  * For LONG_ANSWER: Put the COMPLETE, well-structured exam-ready answer covering EVERY parameter requested in the question, scaled to the visible marks (e.g., 5-6 detailed comparison points/bullets for a 5-mark question).
+  * For DIRECT_VALUE / CODE_FIX: Put the clean raw value/code.
+  * For MCQ: "".
+- "expanded_note":
+  * For LONG_ANSWER: Put the SAME complete, structured multi-point answer as copy_value so it displays immediately in the expanded cursor card.
+  * For CONCEPT_EXPLAIN / UI_GUIDE: Concise 3-bullet breakdown.
+  * Otherwise "".
+- "pointer_xy": If UI_GUIDE and a specific button/icon is visible, return [x, y] normalized 0-1000; otherwise null.
 """
 
 
@@ -201,7 +206,7 @@ def analyze_context(req: AnalyzeRequest):
             clean_b64 = req.image_base64.split(",")[-1]
             key = hashlib.md5(clean_b64.encode()).hexdigest()
             img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-            img.thumbnail((800, 800))
+            img.thumbnail((960, 960))
             contents.append(img)
         elif req.text_content:
             key = hashlib.md5(req.text_content.encode()).hexdigest()
