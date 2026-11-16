@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import time
@@ -24,8 +25,8 @@ app.add_middleware(
 RESULT_CACHE = {}
 CACHE_TTL = 600
 
-PROMPT = """You are an expert academic and technical verification engine. 
-Verify formulas, option numbers, and logical constraints step-by-step. Return valid JSON only with no markdown wrapping or extra text:
+PROMPT = """You are an expert academic and technical verification engine.
+Verify formulas, option numbers, and logical constraints step-by-step. Return ONLY valid JSON with no markdown wrapping or extra text:
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
 Rules:
 - MCQ: cursor_pill = exact option letter/number + text (e.g. "2. Stratified"). copy_value="", expanded_note="".
@@ -49,76 +50,106 @@ def health():
         "providers": {
             "gemini": bool(os.environ.get("GEMINI_API_KEY")),
             "groq": bool(os.environ.get("GROQ_API_KEY")),
-            "openrouter": bool(os.environ.get("OPENROUTER_API_KEY"))
-        }
+            "openrouter": bool(os.environ.get("OPENROUTER_API_KEY")),
+        },
     }
 
 
-def call_groq(prompt_text, image_b64=None):
+def extract_json_safely(raw_text: str) -> dict:
+    if not raw_text:
+        raise ValueError("Empty model response")
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.S).strip()
+    match = re.search(r"\{.*\}", cleaned, re.S)
+    if not match:
+        raise ValueError("No valid JSON object found")
+    data = json.loads(match.group(0))
+    if isinstance(data, list) and data:
+        data = data[0]
+    data.setdefault("detected_type", "DIRECT_VALUE")
+    data.setdefault("cursor_pill", "Solution ready")
+    data.setdefault("copy_value", "")
+    data.setdefault("expanded_note", "")
+    data.setdefault("pointer_xy", None)
+    return data
+
+
+def call_groq(prompt_text: str, image_b64: Optional[str] = None) -> str:
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if not key:
         raise RuntimeError("Missing GROQ_API_KEY")
-    
-    messages = [{"role": "system", "content": PROMPT}]
-    user_content = []
-    if prompt_text:
-        user_content.append({"type": "text", "text": prompt_text})
-    if image_b64:
-        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
-    
-    messages.append({"role": "user", "content": user_content if user_content else prompt_text})
 
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if image_b64:
+        model_id = "meta-llama/llama-4-scout-17b-16e-instruct"
+        user_msg = [
+            {"type": "text", "text": f"{PROMPT}\n\n{prompt_text}"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ]
+        messages = [{"role": "user", "content": user_msg}]
+    else:
+        model_id = "llama-3.3-70b-versatile"
+        messages = [
+            {"role": "system", "content": PROMPT},
+            {"role": "user", "content": prompt_text},
+        ]
+
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": model_id,
         "messages": messages,
-        "response_format": {"type": "json_object"},
         "temperature": 0.0,
-        "max_tokens": 2048
+        "max_tokens": 2048,
     }
+    if not image_b64:
+        payload["response_format"] = {"type": "json_object"}
 
     with httpx.Client(timeout=30.0) as client:
-        res = client.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers)
+        res = client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
         if res.status_code != 200:
-            raise RuntimeError(f"Groq HTTP {res.status_code}: {res.text}")
-        data = res.json()
-        return data["choices"][0]["message"]["content"]
+            raise RuntimeError(f"Groq HTTP {res.status_code}: {res.text[:150]}")
+        return res.json()["choices"][0]["message"]["content"]
 
 
-def call_openrouter(prompt_text, image_b64=None):
+def call_openrouter(prompt_text: str, image_b64: Optional[str] = None) -> str:
     key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not key:
         raise RuntimeError("Missing OPENROUTER_API_KEY")
-    
-    messages = [{"role": "system", "content": PROMPT}]
-    user_content = []
-    if prompt_text:
-        user_content.append({"type": "text", "text": prompt_text})
-    if image_b64:
-        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
-    
-    messages.append({"role": "user", "content": user_content if user_content else prompt_text})
 
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://cursor-companion.app",
-        "X-Title": "Cursor Companion"
-    }
+    if image_b64:
+        user_msg = [
+            {"type": "text", "text": f"{PROMPT}\n\n{prompt_text}"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ]
+        messages = [{"role": "user", "content": user_msg}]
+    else:
+        messages = [
+            {"role": "system", "content": PROMPT},
+            {"role": "user", "content": prompt_text},
+        ]
+
     payload = {
         "model": "google/gemini-2.5-flash",
         "messages": messages,
-        "response_format": {"type": "json_object"},
         "temperature": 0.0,
-        "max_tokens": 2048
+        "max_tokens": 2048,
     }
 
     with httpx.Client(timeout=30.0) as client:
-        res = client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
+        res = client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://cursor-companion.app",
+                "X-Title": "Cursor Companion",
+            },
+        )
         if res.status_code != 200:
-            raise RuntimeError(f"OpenRouter HTTP {res.status_code}: {res.text}")
-        data = res.json()
-        return data["choices"][0]["message"]["content"]
+            raise RuntimeError(f"OpenRouter HTTP {res.status_code}: {res.text[:150]}")
+        return res.json()["choices"][0]["message"]["content"]
 
 
 @app.post("/analyze")
@@ -127,6 +158,7 @@ def analyze_context(req: AnalyzeRequest):
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
         contents_text = ""
         img_pil = None
+        img_b64_str = None
         raw_key = ""
 
         if req.follow_up and req.prior_context:
@@ -134,10 +166,13 @@ def analyze_context(req: AnalyzeRequest):
             raw_key = contents_text
         elif req.image_base64:
             clean_b64 = req.image_base64.split(",")[-1]
-            raw_key = clean_b64[:100]
+            raw_key = hashlib.md5(clean_b64.encode()).hexdigest()
             img_bytes = base64.b64decode(clean_b64)
             img_pil = Image.open(BytesIO(img_bytes)).convert("RGB")
-            img_pil.thumbnail((840, 840))
+            img_pil.thumbnail((840, 840), Image.LANCZOS)
+            buf = BytesIO()
+            img_pil.save(buf, format="JPEG", quality=85)
+            img_b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
             contents_text = "Analyze this image and provide the requested JSON output."
         elif req.text_content:
             contents_text = f"Text:\n{req.text_content}"
@@ -148,7 +183,7 @@ def analyze_context(req: AnalyzeRequest):
                 "cursor_pill": "Empty input received",
                 "copy_value": "",
                 "expanded_note": "Please provide text or image content.",
-                "pointer_xy": None
+                "pointer_xy": None,
             }
 
         key = hashlib.md5(raw_key.encode()).hexdigest()
@@ -166,62 +201,35 @@ def analyze_context(req: AnalyzeRequest):
                 contents = [PROMPT, contents_text]
                 if img_pil is not None:
                     contents.append(img_pil)
-                
                 response = client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=contents,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         temperature=0.0,
-                        max_output_tokens=2048
-                    )
+                        max_output_tokens=2048,
+                    ),
                 )
                 if response and response.text:
                     raw_json = response.text
             except Exception as e:
-                last_error = f"Gemini 2.5 failed: {e}"
+                last_error = f"Gemini: {e}"
 
-        # --- TIER 2: Groq Llama 3.3 70B ---
+        # --- TIER 2: Groq Vision / Llama 3.3 70B ---
         if not raw_json:
             try:
-                img_b64_str = None
-                if img_pil:
-                    buffered = BytesIO()
-                    img_pil.save(buffered, format="JPEG", quality=85)
-                    img_b64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
                 raw_json = call_groq(contents_text, img_b64_str)
             except Exception as e:
-                last_error = f"{last_error} | Groq failed: {e}"
+                last_error = f"{last_error} | Groq: {e}"
 
-        # --- TIER 3: OpenRouter Redundancy ---
+        # --- TIER 3: OpenRouter Failover ---
         if not raw_json:
             try:
-                img_b64_str = None
-                if img_pil:
-                    buffered = BytesIO()
-                    img_pil.save(buffered, format="JPEG", quality=85)
-                    img_b64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
                 raw_json = call_openrouter(contents_text, img_b64_str)
             except Exception as e:
-                raise RuntimeError(f"All 3 enterprise AI tiers failed. Last errors: {last_error} | OpenRouter: {e}")
+                raise RuntimeError(f"All 3 AI tiers failed: {last_error} | OpenRouter: {e}")
 
-        # Strict JSON cleaning & sanitization
-        cleaned = raw_json.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned.removeprefix("```json").removesuffix("```").strip()
-        elif cleaned.startswith("```"):
-            cleaned = cleaned.removeprefix("```").removesuffix("```").strip()
-
-        data = json.loads(cleaned)
-        if isinstance(data, list) and data:
-            data = data[0]
-
-        # Defensive keys assignment to guarantee zero client-side crashes
-        data.setdefault("detected_type", "DIRECT_VALUE")
-        data.setdefault("cursor_pill", "Solution ready")
-        data.setdefault("copy_value", "")
-        data.setdefault("expanded_note", "")
-        data.setdefault("pointer_xy", None)
+        data = extract_json_safely(raw_json)
 
         RESULT_CACHE[key] = (time.time(), data)
         if len(RESULT_CACHE) > 200:
@@ -234,5 +242,5 @@ def analyze_context(req: AnalyzeRequest):
             "cursor_pill": f"Err: {str(e)[:45]}",
             "copy_value": "",
             "expanded_note": str(e),
-            "pointer_xy": None
+            "pointer_xy": None,
         }
