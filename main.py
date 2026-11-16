@@ -24,8 +24,7 @@ app.add_middleware(
 
 _GEMINI_CLIENT = None
 _ACTIVE_GEMINI_MODELS = []
-_ACTIVE_GROQ_VISION = []
-_HTTP_CLIENT = httpx.Client(timeout=20.0)
+_HTTP_CLIENT = httpx.Client(timeout=15.0)
 RESULT_CACHE = {}
 CACHE_TTL = 600
 
@@ -40,10 +39,13 @@ Rules:
 
 
 def init_providers():
-    global _GEMINI_CLIENT, _ACTIVE_GEMINI_MODELS, _ACTIVE_GROQ_VISION
+    global _GEMINI_CLIENT, _ACTIVE_GEMINI_MODELS
     g_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if g_key and _GEMINI_CLIENT is None:
-        _GEMINI_CLIENT = genai.Client(api_key=g_key)
+        _GEMINI_CLIENT = genai.Client(
+            api_key=g_key,
+            http_options={"timeout": 15000},
+        )
         try:
             found = []
             for m in _GEMINI_CLIENT.models.list():
@@ -51,9 +53,22 @@ def init_providers():
                 actions = getattr(m, "supported_actions", None) or []
                 low = name.lower()
                 if "generateContent" in actions and low.startswith("gemini"):
-                    if not any(b in low for b in ["image", "audio", "tts", "live", "embedding", "gemma", "robotics", "computer-use"]):
+                    if not any(
+                        b in low
+                        for b in [
+                            "image",
+                            "audio",
+                            "tts",
+                            "live",
+                            "embedding",
+                            "gemma",
+                            "robotics",
+                            "computer-use",
+                            "omni",
+                            "preview",
+                        ]
+                    ):
                         found.append(name)
-            # Prefer newest flash models available on THIS specific API key
             flash = sorted([n for n in found if "flash" in n and "lite" not in n], reverse=True)
             lite = sorted([n for n in found if "flash" in n and "lite" in n], reverse=True)
             pro = sorted([n for n in found if "pro" in n], reverse=True)
@@ -61,20 +76,7 @@ def init_providers():
         except Exception as e:
             print(f"[Startup Gemini list err]: {e}")
         if not _ACTIVE_GEMINI_MODELS:
-            _ACTIVE_GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"]
-
-    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if groq_key and not _ACTIVE_GROQ_VISION:
-        try:
-            r = _HTTP_CLIENT.get(
-                "https://api.groq.com/openai/v1/models",
-                headers={"Authorization": f"Bearer {groq_key}"},
-            )
-            if r.status_code == 200:
-                ids = [x["id"] for x in r.json().get("data", [])]
-                _ACTIVE_GROQ_VISION = [x for x in ids if "vision" in x or "llama-4" in x]
-        except Exception as e:
-            print(f"[Startup Groq list err]: {e}")
+            _ACTIVE_GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
 
 
 @app.on_event("startup")
@@ -96,7 +98,6 @@ def health():
     return {
         "status": "ok",
         "gemini_models": _ACTIVE_GEMINI_MODELS[:4],
-        "groq_vision_models": _ACTIVE_GROQ_VISION,
     }
 
 
@@ -116,49 +117,26 @@ def extract_json(raw_text: str) -> dict:
     return data
 
 
-def call_groq(prompt_text: str, image_b64: Optional[str] = None) -> str:
+def call_groq_text(prompt_text: str) -> str:
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if not key:
         raise RuntimeError("No GROQ_API_KEY")
-
-    if image_b64:
-        if not _ACTIVE_GROQ_VISION:
-            raise RuntimeError("No Groq vision models on key")
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": f"{PROMPT}\n\n{prompt_text}"},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+    res = _HTTP_CLIENT.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        json={
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": PROMPT},
+                {"role": "user", "content": prompt_text},
             ],
-        }]
-        last_err = None
-        for mid in _ACTIVE_GROQ_VISION[:2]:
-            res = _HTTP_CLIENT.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                json={"model": mid, "messages": messages, "temperature": 0.0, "max_tokens": 1200},
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            )
-            if res.status_code == 200:
-                return res.json()["choices"][0]["message"]["content"]
-            last_err = f"{mid}:{res.status_code}"
-        raise RuntimeError(f"Groq vision failed ({last_err})")
-    else:
-        res = _HTTP_CLIENT.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": PROMPT},
-                    {"role": "user", "content": prompt_text},
-                ],
-                "temperature": 0.0,
-                "max_tokens": 1200,
-            },
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        )
-        if res.status_code != 200:
-            raise RuntimeError(f"Groq text {res.status_code}")
-        return res.json()["choices"][0]["message"]["content"]
+            "temperature": 0.0,
+            "max_tokens": 1200,
+        },
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    if res.status_code != 200:
+        raise RuntimeError(f"Groq {res.status_code}")
+    return res.json()["choices"][0]["message"]["content"]
 
 
 @app.post("/analyze")
@@ -169,7 +147,6 @@ def analyze_context(req: AnalyzeRequest):
     try:
         contents_text = ""
         img_pil = None
-        img_b64_str = None
         raw_key = ""
 
         if req.follow_up and req.prior_context:
@@ -180,15 +157,18 @@ def analyze_context(req: AnalyzeRequest):
             raw_key = hashlib.md5(clean_b64.encode()).hexdigest()
             img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
             img_pil.thumbnail((720, 720), Image.BILINEAR)
-            buf = BytesIO()
-            img_pil.save(buf, format="JPEG", quality=78)
-            img_b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
             contents_text = "Solve the problem shown in this image accurately."
         elif req.text_content:
             contents_text = f"Solve:\n{req.text_content}"
             raw_key = req.text_content
         else:
-            return {"detected_type": "ERROR", "cursor_pill": "Select text or snip area first", "copy_value": "", "expanded_note": "", "pointer_xy": None}
+            return {
+                "detected_type": "ERROR",
+                "cursor_pill": "Select text or snip area first",
+                "copy_value": "",
+                "expanded_note": "",
+                "pointer_xy": None,
+            }
 
         key = hashlib.md5(raw_key.encode()).hexdigest()
         hit = RESULT_CACHE.get(key)
@@ -209,7 +189,9 @@ def analyze_context(req: AnalyzeRequest):
                         temperature=0.0,
                         max_output_tokens=1500,
                     )
-                    res = _GEMINI_CLIENT.models.generate_content(model=model_name, contents=contents, config=cfg)
+                    res = _GEMINI_CLIENT.models.generate_content(
+                        model=model_name, contents=contents, config=cfg
+                    )
                     if res and res.text:
                         raw_json = res.text
                         break
@@ -217,11 +199,11 @@ def analyze_context(req: AnalyzeRequest):
                     last_err = f"{model_name}: {str(e)[:60]}"
                     continue
 
+        if not raw_json and img_pil is None:
+            raw_json = call_groq_text(contents_text)
+
         if not raw_json:
-            try:
-                raw_json = call_groq(contents_text, img_b64_str)
-            except Exception as ge:
-                raise RuntimeError(f"{last_err} | {ge}")
+            raise RuntimeError(last_err or "Service temporarily busy")
 
         data = extract_json(raw_json)
         RESULT_CACHE[key] = (time.time(), data)
