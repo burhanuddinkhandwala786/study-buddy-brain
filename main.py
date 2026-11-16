@@ -44,13 +44,14 @@ class AnalyzeRequest(BaseModel):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
+    or_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     return {
         "status": "ok",
-        "system": "triple-redundancy-enterprise-live",
+        "system": "enterprise-live-v3.5",
         "providers": {
             "gemini": bool(os.environ.get("GEMINI_API_KEY")),
             "groq": bool(os.environ.get("GROQ_API_KEY")),
-            "openrouter": bool(os.environ.get("OPENROUTER_API_KEY")),
+            "openrouter_valid_prefix": or_key.startswith("sk-or-"),
         },
     }
 
@@ -73,49 +74,110 @@ def extract_json_safely(raw_text: str) -> dict:
     return data
 
 
+def call_gemini_cascade(prompt_text: str, img_pil: Optional[Image.Image] = None) -> str:
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Missing GEMINI_API_KEY")
+
+    client = genai.Client(api_key=key)
+    contents = [PROMPT, prompt_text]
+    if img_pil is not None:
+        contents.append(img_pil)
+
+    # Uses the exact active models supported by your key + live fallback discovery
+    models_to_try = [
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-2.5-flash",
+    ]
+    try:
+        for m in client.models.list():
+            name = (m.name or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if "generateContent" in actions and "flash" in name.lower() and name not in models_to_try:
+                if not any(b in name.lower() for b in ["image", "audio", "tts", "live"]):
+                    models_to_try.append(name)
+    except Exception:
+        pass
+
+    last_err = None
+    for model_name in models_to_try[:5]:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0,
+                    max_output_tokens=2048,
+                ),
+            )
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"Gemini unavailable: {last_err}")
+
+
 def call_groq(prompt_text: str, image_b64: Optional[str] = None) -> str:
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if not key:
         raise RuntimeError("Missing GROQ_API_KEY")
 
     if image_b64:
-        model_id = "meta-llama/llama-4-scout-17b-16e-instruct"
+        # Try active Groq multimodal vision models
+        vision_models = [
+            "llama-3.2-90b-vision-preview",
+            "llama-3.2-11b-vision-preview",
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+        ]
         user_msg = [
             {"type": "text", "text": f"{PROMPT}\n\n{prompt_text}"},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
         ]
-        messages = [{"role": "user", "content": user_msg}]
+        last_err = None
+        for m in vision_models:
+            try:
+                with httpx.Client(timeout=25.0) as client:
+                    res = client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        json={"model": m, "messages": [{"role": "user", "content": user_msg}], "temperature": 0.0, "max_tokens": 2048},
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    )
+                    if res.status_code == 200:
+                        return res.json()["choices"][0]["message"]["content"]
+                    last_err = f"{res.status_code}: {res.text[:100]}"
+            except Exception as e:
+                last_err = str(e)
+        raise RuntimeError(f"Groq vision failed: {last_err}")
     else:
-        model_id = "llama-3.3-70b-versatile"
-        messages = [
-            {"role": "system", "content": PROMPT},
-            {"role": "user", "content": prompt_text},
-        ]
-
-    payload = {
-        "model": model_id,
-        "messages": messages,
-        "temperature": 0.0,
-        "max_tokens": 2048,
-    }
-    if not image_b64:
-        payload["response_format"] = {"type": "json_object"}
-
-    with httpx.Client(timeout=30.0) as client:
-        res = client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        )
-        if res.status_code != 200:
-            raise RuntimeError(f"Groq HTTP {res.status_code}: {res.text[:150]}")
-        return res.json()["choices"][0]["message"]["content"]
+        with httpx.Client(timeout=25.0) as client:
+            res = client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {"role": "system", "content": PROMPT},
+                        {"role": "user", "content": prompt_text},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.0,
+                    "max_tokens": 2048,
+                },
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            )
+            if res.status_code != 200:
+                raise RuntimeError(f"Groq HTTP {res.status_code}")
+            return res.json()["choices"][0]["message"]["content"]
 
 
 def call_openrouter(prompt_text: str, image_b64: Optional[str] = None) -> str:
     key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("Missing OPENROUTER_API_KEY")
+    if not key or not key.startswith("sk-or-"):
+        raise RuntimeError("Invalid OpenRouter key prefix")
 
     if image_b64:
         user_msg = [
@@ -129,17 +191,15 @@ def call_openrouter(prompt_text: str, image_b64: Optional[str] = None) -> str:
             {"role": "user", "content": prompt_text},
         ]
 
-    payload = {
-        "model": "google/gemini-2.5-flash",
-        "messages": messages,
-        "temperature": 0.0,
-        "max_tokens": 2048,
-    }
-
-    with httpx.Client(timeout=30.0) as client:
+    with httpx.Client(timeout=25.0) as client:
         res = client.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            json=payload,
+            json={
+                "model": "google/gemini-2.5-flash",
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 2048,
+            },
             headers={
                 "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
@@ -148,14 +208,13 @@ def call_openrouter(prompt_text: str, image_b64: Optional[str] = None) -> str:
             },
         )
         if res.status_code != 200:
-            raise RuntimeError(f"OpenRouter HTTP {res.status_code}: {res.text[:150]}")
+            raise RuntimeError(f"OpenRouter HTTP {res.status_code}")
         return res.json()["choices"][0]["message"]["content"]
 
 
 @app.post("/analyze")
 def analyze_context(req: AnalyzeRequest):
     try:
-        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
         contents_text = ""
         img_pil = None
         img_b64_str = None
@@ -180,9 +239,9 @@ def analyze_context(req: AnalyzeRequest):
         else:
             return {
                 "detected_type": "ERROR",
-                "cursor_pill": "Empty input received",
+                "cursor_pill": "Select text or snip an area first",
                 "copy_value": "",
-                "expanded_note": "Please provide text or image content.",
+                "expanded_note": "",
                 "pointer_xy": None,
             }
 
@@ -192,42 +251,27 @@ def analyze_context(req: AnalyzeRequest):
             return hit[1]
 
         raw_json = None
-        last_error = None
 
-        # --- TIER 1: Gemini 2.5 Flash ---
-        if gemini_key:
-            try:
-                client = genai.Client(api_key=gemini_key)
-                contents = [PROMPT, contents_text]
-                if img_pil is not None:
-                    contents.append(img_pil)
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.0,
-                        max_output_tokens=2048,
-                    ),
-                )
-                if response and response.text:
-                    raw_json = response.text
-            except Exception as e:
-                last_error = f"Gemini: {e}"
+        # Tier 1: Gemini 3.5 Flash + live model list fallback
+        try:
+            raw_json = call_gemini_cascade(contents_text, img_pil)
+        except Exception as e:
+            print(f"[Tier 1 Gemini Log]: {e}")
 
-        # --- TIER 2: Groq Vision / Llama 3.3 70B ---
+        # Tier 2: Groq Vision / Llama 3.3 70B
         if not raw_json:
             try:
                 raw_json = call_groq(contents_text, img_b64_str)
             except Exception as e:
-                last_error = f"{last_error} | Groq: {e}"
+                print(f"[Tier 2 Groq Log]: {e}")
 
-        # --- TIER 3: OpenRouter Failover ---
+        # Tier 3: OpenRouter Failover
         if not raw_json:
             try:
                 raw_json = call_openrouter(contents_text, img_b64_str)
             except Exception as e:
-                raise RuntimeError(f"All 3 AI tiers failed: {last_error} | OpenRouter: {e}")
+                print(f"[Tier 3 OpenRouter Log]: {e}")
+                raise RuntimeError("Service temporarily busy. Please retry in a moment.")
 
         data = extract_json_safely(raw_json)
 
@@ -237,10 +281,12 @@ def analyze_context(req: AnalyzeRequest):
 
         return data
     except Exception as e:
+        # Log technical details on Render server logs ONLY—never expose raw API traces to end users
+        print(f"[CRITICAL BACKEND ERROR]: {e}")
         return {
             "detected_type": "ERROR",
-            "cursor_pill": f"Err: {str(e)[:45]}",
+            "cursor_pill": "High traffic — please press hotkey again",
             "copy_value": "",
-            "expanded_note": str(e),
+            "expanded_note": "",
             "pointer_xy": None,
         }
