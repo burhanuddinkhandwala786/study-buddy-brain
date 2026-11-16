@@ -3,6 +3,8 @@ import json
 import base64
 import time
 import hashlib
+from io import BytesIO
+from PIL import Image
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -25,7 +27,6 @@ RESULT_CACHE = {}
 CACHE_TTL = 600
 COOLDOWN_SECS = 65
 
-# Flash-Lite first: 3x faster inference + higher free-tier RPM quota (avoids slow 429 retry loops)
 PREFERRED = [
     "gemini-2.5-flash-lite",
     "gemini-flash-lite-latest",
@@ -79,7 +80,7 @@ def is_model_problem(err_str: str) -> bool:
         for k in [
             "404", "not_found", "not found", "no longer available",
             "deprecated", "is not supported", "429", "resource_exhausted",
-            "503", "unavailable", "overloaded"
+            "503", "unavailable", "overloaded", "invalid_argument"
         ]
     )
 
@@ -97,17 +98,17 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
     if not ready:
         raise RuntimeError("Rate limited. Wait 60s and try again.")
 
-    budget = 512 if deep_think else 0
-
     for model_name in ready[:5]:
         try:
             cfg_kwargs = {
                 "response_mime_type": "application/json",
                 "temperature": 0.0,
-                "max_output_tokens": 900 if deep_think else 220,
             }
-            if "2.5" in model_name or "flash" in model_name:
-                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=budget)
+            # Only pass thinking_config on non-lite 2.5 models
+            if "2.5" in model_name and "lite" not in model_name:
+                cfg_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_budget=512 if deep_think else 0
+                )
 
             try:
                 response = client.models.generate_content(
@@ -116,7 +117,8 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
                     config=types.GenerateContentConfig(**cfg_kwargs),
                 )
             except Exception as inner_e:
-                if "thinking" in str(inner_e).lower():
+                # Retry cleanly without thinking_config if rejected
+                if "thinking_config" in cfg_kwargs:
                     cfg_kwargs.pop("thinking_config", None)
                     response = client.models.generate_content(
                         model=model_name,
@@ -200,9 +202,9 @@ def analyze_context(req: AnalyzeRequest):
         elif req.image_base64:
             clean_b64 = req.image_base64.split(",")[-1]
             key = hashlib.md5(clean_b64.encode()).hexdigest()
-            # Pass JPEG bytes directly without slow PIL decode/re-encode on server CPU
-            img_bytes = base64.b64decode(clean_b64)
-            contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+            img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
+            img.thumbnail((820, 820))
+            contents.append(img)
         elif req.text_content:
             key = hashlib.md5(req.text_content.encode()).hexdigest()
             low_t = req.text_content.lower()
