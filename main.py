@@ -27,7 +27,6 @@ RESULT_CACHE = {}
 CACHE_TTL = 600
 COOLDOWN_SECS = 65
 
-# Flash-Lite first for sub-second MCQ/short inference; 2.5-flash used when deep verification is needed
 PREFERRED = [
     "gemini-2.5-flash-lite",
     "gemini-flash-lite-latest",
@@ -90,7 +89,6 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
     global WORKING_MODEL
     models_to_try = []
 
-    # For complex/analytical queries, prefer 2.5-flash with verification thinking first
     if deep_think:
         for m in ["gemini-2.5-flash", "gemini-flash-latest"]:
             if m in get_candidate_models(client):
@@ -110,12 +108,12 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
 
     for model_name in ready[:4]:
         try:
-            # google-genai expects timeout in SECONDS (4s for fast path, 8s for deep verification)
+            # Minimum allowed deadline by Google API is 10s
             cfg_kwargs = {
                 "response_mime_type": "application/json",
                 "temperature": 0.0,
                 "max_output_tokens": 750 if deep_think else 200,
-                "http_options": {"timeout": 8 if deep_think else 4},
+                "http_options": {"timeout": 12},
             }
             if "2.5" in model_name and "lite" not in model_name:
                 cfg_kwargs["thinking_config"] = types.ThinkingConfig(
