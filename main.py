@@ -184,13 +184,13 @@ def error_response(msg: str, detail: str = ""):
     }
 
 
-PROMPT = """Verify the facts and logic carefully before answering. Return valid JSON only:
+PROMPT = """Analyze the image or text with rigorous academic accuracy. Verify formulas, option numbers, and logical constraints step-by-step before answering. Return valid JSON only:
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
 Rules:
-- MCQ: cursor_pill = exact option number/letter + text (e.g. "1. Both A and R are correct..."). copy_value="", expanded_note="".
+- MCQ: cursor_pill = exact option letter/number + text (e.g. "2. Stratified"). copy_value="", expanded_note="".
 - DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer/fixed line; copy_value = same raw value; expanded_note="".
-- LONG_ANSWER (marks >= 3, Differentiate, Compare, Derive, Explain in detail, or follow-up): cursor_pill = short title; copy_value & expanded_note = complete structured multi-point answer covering every requested parameter.
-- CONCEPT_EXPLAIN / UI_GUIDE: cursor_pill = 1-line summary; expanded_note = 3 crisp bullets; pointer_xy = [x,y] 0-1000 if UI button visible else null."""
+- LONG_ANSWER (marks >= 3, derivations, proofs, code logic, or comparisons): cursor_pill = short title; copy_value & expanded_note = rigorous, complete multi-point breakdown.
+- CONCEPT_EXPLAIN / UI_GUIDE: cursor_pill = 1-line summary; expanded_note = 3 high-yield bullet points."""
 
 
 @app.post("/analyze")
