@@ -3,4 +3,4 @@ uvicorn
 google-genai
 pillow
 pydantic
-anthropic
+httpx
