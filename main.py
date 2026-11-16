@@ -29,7 +29,7 @@ RESULT_CACHE = {}
 CACHE_TTL = 600
 
 PROMPT = """You are an expert academic and technical verification engine.
-Verify formulas, option numbers, and logical constraints carefully before answering. Return ONLY valid JSON:
+Verify formulas, Indian/regional GK awards, option letters, and logical constraints carefully—never be misled by already-clicked radio buttons. Return ONLY valid JSON:
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
 Rules:
 - MCQ: cursor_pill = exact option letter/number + text (e.g. "4. Bharuch"). copy_value="", expanded_note="".
@@ -182,7 +182,7 @@ def analyze_context(req: AnalyzeRequest):
                         response_mime_type="application/json",
                         temperature=0.0,
                         max_output_tokens=1200,
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                        thinking_config=types.ThinkingConfig(thinking_budget=256),
                     )
                     res = _GEMINI_CLIENT.models.generate_content(model=model_name, contents=contents, config=cfg)
                     if res and res.text:
