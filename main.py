@@ -27,11 +27,12 @@ RESULT_CACHE = {}
 CACHE_TTL = 600
 COOLDOWN_SECS = 65
 
+# Flash-Lite first for sub-second MCQ/short inference; 2.5-flash used when deep verification is needed
 PREFERRED = [
-    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-flash-latest",
     "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
 ]
 BLOCKED_WORDS = [
     "embedding", "imagen", "veo", "aqa", "tts", "image",
@@ -62,7 +63,7 @@ def get_candidate_models(client):
         ordered = [m for m in PREFERRED if m in available]
         rest = sorted(
             [m for m in available if m not in ordered],
-            key=lambda n: ("flash" not in n, n),
+            key=lambda n: ("lite" not in n, "flash" not in n, n),
         )
         ordered += rest
     else:
@@ -87,7 +88,16 @@ def is_model_problem(err_str: str) -> bool:
 
 def call_gemini_with_fallback(client, contents, deep_think: bool = False):
     global WORKING_MODEL
-    models_to_try = [WORKING_MODEL] if WORKING_MODEL else []
+    models_to_try = []
+
+    # For complex/analytical queries, prefer 2.5-flash with verification thinking first
+    if deep_think:
+        for m in ["gemini-2.5-flash", "gemini-flash-latest"]:
+            if m in get_candidate_models(client):
+                models_to_try.append(m)
+    elif WORKING_MODEL:
+        models_to_try.append(WORKING_MODEL)
+
     for m in get_candidate_models(client):
         if m not in models_to_try:
             models_to_try.append(m)
@@ -98,12 +108,14 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
     if not ready:
         raise RuntimeError("Rate limited. Wait 60s and try again.")
 
-    for model_name in ready[:5]:
+    for model_name in ready[:4]:
         try:
+            # google-genai expects timeout in SECONDS (4s for fast path, 8s for deep verification)
             cfg_kwargs = {
                 "response_mime_type": "application/json",
                 "temperature": 0.0,
-                "http_options": {"timeout": 8000},
+                "max_output_tokens": 750 if deep_think else 200,
+                "http_options": {"timeout": 8 if deep_think else 4},
             }
             if "2.5" in model_name and "lite" not in model_name:
                 cfg_kwargs["thinking_config"] = types.ThinkingConfig(
@@ -127,7 +139,8 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
                 else:
                     raise inner_e
 
-            WORKING_MODEL = model_name
+            if not deep_think:
+                WORKING_MODEL = model_name
             return response.text
         except Exception as e:
             last_err = e
@@ -175,11 +188,11 @@ def error_response(msg: str, detail: str = ""):
     }
 
 
-PROMPT = """Return valid JSON only:
+PROMPT = """Verify the facts and logic carefully before answering. Return valid JSON only:
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
 Rules:
 - MCQ: cursor_pill = exact option number/letter + text (e.g. "1. Both A and R are correct..."). copy_value="", expanded_note="".
-- DIRECT_VALUE / CODE_FIX: cursor_pill = exact answer/fixed line; copy_value = same raw value; expanded_note="".
+- DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer/fixed line; copy_value = same raw value; expanded_note="".
 - LONG_ANSWER (marks >= 3, Differentiate, Compare, Derive, Explain in detail, or follow-up): cursor_pill = short title; copy_value & expanded_note = complete structured multi-point answer covering every requested parameter.
 - CONCEPT_EXPLAIN / UI_GUIDE: cursor_pill = 1-line summary; expanded_note = 3 crisp bullets; pointer_xy = [x,y] 0-1000 if UI button visible else null."""
 
@@ -202,7 +215,7 @@ def analyze_context(req: AnalyzeRequest):
             clean_b64 = req.image_base64.split(",")[-1]
             key = hashlib.md5(clean_b64.encode()).hexdigest()
             img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-            img.thumbnail((600, 600))
+            img.thumbnail((560, 560))
             contents.append(img)
         elif req.text_content:
             key = hashlib.md5(req.text_content.encode()).hexdigest()
