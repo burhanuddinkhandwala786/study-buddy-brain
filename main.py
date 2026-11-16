@@ -85,7 +85,7 @@ def is_model_problem(err_str: str) -> bool:
     )
 
 
-def call_gemini_with_fallback(client, contents):
+def call_gemini_with_fallback(client, contents, deep_think: bool = False):
     global WORKING_MODEL
     models_to_try = [WORKING_MODEL] if WORKING_MODEL else []
     for m in get_candidate_models(client):
@@ -98,6 +98,8 @@ def call_gemini_with_fallback(client, contents):
     if not ready:
         raise RuntimeError("Rate limited. Wait 60s and try again.")
 
+    budget = 1024 if deep_think else 0
+
     for model_name in ready[:8]:
         try:
             cfg_kwargs = {
@@ -105,7 +107,7 @@ def call_gemini_with_fallback(client, contents):
                 "temperature": 0.0,
             }
             if "2.5" in model_name or "flash" in model_name:
-                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=budget)
 
             try:
                 response = client.models.generate_content(
@@ -144,6 +146,8 @@ def call_gemini_with_fallback(client, contents):
 class AnalyzeRequest(BaseModel):
     image_base64: Optional[str] = None
     text_content: Optional[str] = None
+    follow_up: Optional[str] = None
+    prior_context: Optional[str] = None
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -171,21 +175,21 @@ def error_response(msg: str, detail: str = ""):
 
 
 PROMPT = """
-You are an ultra-fast, high-precision study intelligence. Read the ENTIRE visible screen carefully—including mark badges (like "+5 Marks", "10 Marks"), sub-criteria (like "based on architecture, functionality, input/output, applications"), or MCQ options—before choosing the response format. Return valid JSON with keys:
+You are an enterprise-grade, ultra-precise study and engineering intelligence. Read the ENTIRE visible screen or text carefully—including mark badges (like "+5 Marks", "10 Marks"), equations, circuit diagrams, sub-criteria, or MCQ options—before answering. Return valid JSON with keys:
 - "detected_type": "MCQ" | "DIRECT_VALUE" | "CODE_FIX" | "UI_GUIDE" | "LONG_ANSWER" | "CONCEPT_EXPLAIN"
 - "cursor_pill": Short headline displayed on the cursor tip:
   * If MCQ: ONLY the exact option letter and text (e.g., "B) Half-wave dipole"). Zero explanation.
   * If Numerical / Fill-in-blank: ONLY the exact final verified value/unit.
   * If Code error: ONLY the corrected line of code.
   * If UI/Software screen asking how/where to do something: 1-line instruction (e.g., "Click Export -> PDF").
-  * If LONG_ANSWER (any question showing marks >= 3, "Differentiate", "Compare", "Explain", or listing multiple parameters): Crisp 1-line summary title (e.g., "LFSR vs MISR (5-Mark Breakdown)").
+  * If LONG_ANSWER (any question showing marks >= 3, "Differentiate", "Compare", "Derive", "Explain", or a follow-up question): Crisp 1-line headline summary.
   * If CONCEPT_EXPLAIN (short 1-2 mark definition): 1 crisp sentence definition.
 - "copy_value":
-  * For LONG_ANSWER: Put the COMPLETE, well-structured exam-ready answer covering EVERY parameter requested in the question, scaled to the visible marks (e.g., 5-6 detailed comparison points/bullets for a 5-mark question).
-  * For DIRECT_VALUE / CODE_FIX: Put the clean raw value/code.
+  * For LONG_ANSWER: Complete, well-structured answer covering EVERY parameter requested, scaled to the marks (5-6 detailed points for 5 marks).
+  * For DIRECT_VALUE / CODE_FIX: Clean raw value/code.
   * For MCQ: "".
 - "expanded_note":
-  * For LONG_ANSWER: Put the SAME complete, structured multi-point answer as copy_value so it displays immediately in the expanded cursor card.
+  * For LONG_ANSWER: Same complete structured multi-point answer as copy_value.
   * For CONCEPT_EXPLAIN / UI_GUIDE: Concise 3-bullet breakdown.
   * Otherwise "".
 - "pointer_xy": If UI_GUIDE and a specific button/icon is visible, return [x, y] normalized 0-1000; otherwise null.
@@ -201,8 +205,12 @@ def analyze_context(req: AnalyzeRequest):
     try:
         client = genai.Client(api_key=api_key)
         contents = [PROMPT]
+        deep_think = bool(req.follow_up)
 
-        if req.image_base64:
+        if req.follow_up and req.prior_context:
+            contents.append(f"Previous answer context:\n{req.prior_context}\n\nUser follow-up question:\n{req.follow_up}")
+            key = hashlib.md5((req.prior_context + req.follow_up).encode()).hexdigest()
+        elif req.image_base64:
             clean_b64 = req.image_base64.split(",")[-1]
             key = hashlib.md5(clean_b64.encode()).hexdigest()
             img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
@@ -210,6 +218,9 @@ def analyze_context(req: AnalyzeRequest):
             contents.append(img)
         elif req.text_content:
             key = hashlib.md5(req.text_content.encode()).hexdigest()
+            low_t = req.text_content.lower()
+            if any(w in low_t for w in ["differentiate", "derive", "explain", "compare", "marks", "circuit", "calculate"]):
+                deep_think = True
             contents.append(f"Selected text:\n{req.text_content}")
         else:
             return error_response("Empty input")
@@ -218,7 +229,7 @@ def analyze_context(req: AnalyzeRequest):
         if hit and time.time() - hit[0] < CACHE_TTL:
             return hit[1]
 
-        raw_json = call_gemini_with_fallback(client, contents)
+        raw_json = call_gemini_with_fallback(client, contents, deep_think=deep_think)
         cleaned = (
             raw_json.strip()
             .removeprefix("```json")
