@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import base64
 import time
@@ -10,7 +9,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import httpx
 from google import genai
 from google.genai import types
 
@@ -22,66 +20,141 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_GEMINI_CLIENT = None
-_ACTIVE_GEMINI_MODELS = []
-_HTTP_CLIENT = httpx.Client(timeout=15.0)
+WORKING_MODEL = None
+_CANDIDATES = {"models": [], "ts": 0}
+COOLDOWN = {}
 RESULT_CACHE = {}
 CACHE_TTL = 600
+COOLDOWN_SECS = 65
 
-PROMPT = """You are an expert academic and technical verification engine.
-Verify formulas, option numbers, and logical constraints carefully before answering. Return ONLY valid JSON:
-{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
-Rules:
-- MCQ: cursor_pill = exact option letter/number + text (e.g. "4. Bharuch"). copy_value="", expanded_note="".
-- DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer/fixed line; copy_value = same raw value; expanded_note="".
-- LONG_ANSWER: cursor_pill = short title; copy_value & expanded_note = complete structured breakdown.
-- CONCEPT_EXPLAIN: cursor_pill = 1-line summary; expanded_note = 3 high-yield bullet points."""
+PREFERRED = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+]
+BLOCKED_WORDS = [
+    "embedding", "imagen", "veo", "aqa", "tts", "image",
+    "live", "audio", "robotics", "computer-use", "learnlm", "gemma",
+    "omni", "preview"
+]
 
 
-def init_providers():
-    global _GEMINI_CLIENT, _ACTIVE_GEMINI_MODELS
-    g_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if g_key and _GEMINI_CLIENT is None:
-        _GEMINI_CLIENT = genai.Client(
-            api_key=g_key,
-            http_options={"timeout": 15000},
+def get_candidate_models(client):
+    if _CANDIDATES["models"] and time.time() - _CANDIDATES["ts"] < 3600:
+        return _CANDIDATES["models"]
+
+    available = []
+    try:
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            name = (m.name or "").replace("models/", "")
+            low = name.lower()
+            if (
+                "generateContent" in actions
+                and low.startswith("gemini")
+                and not any(x in low for x in BLOCKED_WORDS)
+            ):
+                available.append(name)
+    except Exception:
+        pass
+
+    if available:
+        ordered = [m for m in PREFERRED if m in available]
+        rest = sorted(
+            [m for m in available if m not in ordered],
+            key=lambda n: ("lite" not in n, "flash" not in n, n),
         )
+        ordered += rest
+    else:
+        ordered = list(PREFERRED)
+
+    _CANDIDATES["models"] = ordered
+    _CANDIDATES["ts"] = time.time()
+    return ordered
+
+
+def is_model_problem(err_str: str) -> bool:
+    s = err_str.lower()
+    return any(
+        k in s
+        for k in [
+            "404", "not_found", "not found", "no longer available",
+            "deprecated", "is not supported", "429", "resource_exhausted",
+            "503", "unavailable", "overloaded", "invalid_argument", "timeout", "deadline"
+        ]
+    )
+
+
+def call_gemini_with_fallback(client, contents, deep_think: bool = False):
+    global WORKING_MODEL
+    models_to_try = []
+
+    if deep_think:
+        for m in ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash", "gemini-flash-latest"]:
+            if m in get_candidate_models(client):
+                models_to_try.append(m)
+    elif WORKING_MODEL:
+        models_to_try.append(WORKING_MODEL)
+
+    for m in get_candidate_models(client):
+        if m not in models_to_try:
+            models_to_try.append(m)
+
+    last_err = None
+    now = time.time()
+    ready = [m for m in models_to_try if COOLDOWN.get(m, 0) <= now]
+    if not ready:
+        raise RuntimeError("Rate limited. Wait 60s and try again.")
+
+    for model_name in ready[:4]:
         try:
-            found = []
-            for m in _GEMINI_CLIENT.models.list():
-                name = (m.name or "").replace("models/", "")
-                actions = getattr(m, "supported_actions", None) or []
-                low = name.lower()
-                if "generateContent" in actions and low.startswith("gemini"):
-                    if not any(
-                        b in low
-                        for b in [
-                            "image",
-                            "audio",
-                            "tts",
-                            "live",
-                            "embedding",
-                            "gemma",
-                            "robotics",
-                            "computer-use",
-                            "omni",
-                            "preview",
-                        ]
-                    ):
-                        found.append(name)
-            flash = sorted([n for n in found if "flash" in n and "lite" not in n], reverse=True)
-            lite = sorted([n for n in found if "flash" in n and "lite" in n], reverse=True)
-            pro = sorted([n for n in found if "pro" in n], reverse=True)
-            _ACTIVE_GEMINI_MODELS = flash + lite + pro
+            cfg_kwargs = {
+                "response_mime_type": "application/json",
+                "temperature": 0.0,
+                "max_output_tokens": 750 if deep_think else 250,
+            }
+            if "lite" not in model_name:
+                cfg_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_budget=512 if deep_think else 0
+                )
+
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**cfg_kwargs),
+                )
+            except Exception as inner_e:
+                if "thinking_config" in cfg_kwargs:
+                    cfg_kwargs.pop("thinking_config", None)
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(**cfg_kwargs),
+                    )
+                else:
+                    raise inner_e
+
+            if not deep_think:
+                WORKING_MODEL = model_name
+            return response.text
         except Exception as e:
-            print(f"[Startup Gemini list err]: {e}")
-        if not _ACTIVE_GEMINI_MODELS:
-            _ACTIVE_GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
+            last_err = e
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                COOLDOWN[model_name] = time.time() + COOLDOWN_SECS
+            if is_model_problem(err_str):
+                if model_name == WORKING_MODEL:
+                    WORKING_MODEL = None
+                continue
+            raise
 
-
-@app.on_event("startup")
-def on_startup():
-    init_providers()
+    _CANDIDATES["ts"] = 0
+    raise RuntimeError(f"All models failed: {last_err}")
 
 
 class AnalyzeRequest(BaseModel):
@@ -93,130 +166,86 @@ class AnalyzeRequest(BaseModel):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
-    if not _ACTIVE_GEMINI_MODELS:
-        init_providers()
+    return {"status": "ok", "cached_working_model": WORKING_MODEL}
+
+
+@app.get("/models")
+def list_models():
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {"error": "GEMINI_API_KEY not set"}
+    client = genai.Client(api_key=api_key)
+    return {"candidates": get_candidate_models(client)}
+
+
+def error_response(msg: str, detail: str = ""):
     return {
-        "status": "ok",
-        "gemini_models": _ACTIVE_GEMINI_MODELS[:4],
+        "detected_type": "ERROR",
+        "cursor_pill": msg,
+        "copy_value": "",
+        "expanded_note": detail,
+        "pointer_xy": None,
     }
 
 
-def extract_json(raw_text: str) -> dict:
-    cleaned = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.S).strip()
-    match = re.search(r"\{.*\}", cleaned, re.S)
-    if not match:
-        raise ValueError("Invalid JSON")
-    data = json.loads(match.group(0))
-    if isinstance(data, list) and data:
-        data = data[0]
-    data.setdefault("detected_type", "DIRECT_VALUE")
-    data.setdefault("cursor_pill", "Done")
-    data.setdefault("copy_value", "")
-    data.setdefault("expanded_note", "")
-    data.setdefault("pointer_xy", None)
-    return data
-
-
-def call_groq_text(prompt_text: str) -> str:
-    key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("No GROQ_API_KEY")
-    res = _HTTP_CLIENT.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        json={
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": PROMPT},
-                {"role": "user", "content": prompt_text},
-            ],
-            "temperature": 0.0,
-            "max_tokens": 1200,
-        },
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
-    if res.status_code != 200:
-        raise RuntimeError(f"Groq {res.status_code}")
-    return res.json()["choices"][0]["message"]["content"]
+PROMPT = """Analyze the image or text with rigorous academic accuracy. Verify formulas, option numbers, and logical constraints step-by-step before answering. Return valid JSON only:
+{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
+Rules:
+- MCQ: cursor_pill = exact option letter/number + text (e.g. "2. Stratified"). copy_value="", expanded_note="".
+- DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer/fixed line; copy_value = same raw value; expanded_note="".
+- LONG_ANSWER (marks >= 3, derivations, proofs, code logic, or comparisons): cursor_pill = short title; copy_value & expanded_note = rigorous, complete multi-point breakdown.
+- CONCEPT_EXPLAIN / UI_GUIDE: cursor_pill = 1-line summary; expanded_note = 3 high-yield bullet points."""
 
 
 @app.post("/analyze")
 def analyze_context(req: AnalyzeRequest):
-    if not _ACTIVE_GEMINI_MODELS:
-        init_providers()
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return error_response("Set GEMINI_API_KEY in Render")
 
     try:
-        contents_text = ""
-        img_pil = None
-        raw_key = ""
+        client = genai.Client(api_key=api_key)
+        contents = [PROMPT]
+        deep_think = bool(req.follow_up)
 
         if req.follow_up and req.prior_context:
-            contents_text = f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}"
-            raw_key = contents_text
+            contents.append(f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}")
+            key = hashlib.md5((req.prior_context + req.follow_up).encode()).hexdigest()
         elif req.image_base64:
             clean_b64 = req.image_base64.split(",")[-1]
-            raw_key = hashlib.md5(clean_b64.encode()).hexdigest()
-            img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-            img_pil.thumbnail((720, 720), Image.BILINEAR)
-            contents_text = "Solve the problem shown in this image accurately."
+            key = hashlib.md5(clean_b64.encode()).hexdigest()
+            img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
+            img.thumbnail((560, 560))
+            contents.append(img)
         elif req.text_content:
-            contents_text = f"Solve:\n{req.text_content}"
-            raw_key = req.text_content
+            key = hashlib.md5(req.text_content.encode()).hexdigest()
+            low_t = req.text_content.lower()
+            if any(w in low_t for w in ["differentiate", "derive", "explain", "compare", "marks", "circuit", "calculate"]):
+                deep_think = True
+            contents.append(f"Text:\n{req.text_content}")
         else:
-            return {
-                "detected_type": "ERROR",
-                "cursor_pill": "Select text or snip area first",
-                "copy_value": "",
-                "expanded_note": "",
-                "pointer_xy": None,
-            }
+            return error_response("Empty input")
 
-        key = hashlib.md5(raw_key.encode()).hexdigest()
         hit = RESULT_CACHE.get(key)
         if hit and time.time() - hit[0] < CACHE_TTL:
             return hit[1]
 
-        raw_json = None
-        last_err = ""
+        raw_json = call_gemini_with_fallback(client, contents, deep_think=deep_think)
+        cleaned = (
+            raw_json.strip()
+            .removeprefix("```json")
+            .removeprefix("```")
+            .removesuffix("```")
+            .strip()
+        )
+        data = json.loads(cleaned)
+        if isinstance(data, list) and data:
+            data = data[0]
 
-        if _GEMINI_CLIENT:
-            for model_name in _ACTIVE_GEMINI_MODELS[:3]:
-                try:
-                    contents = [PROMPT, contents_text]
-                    if img_pil is not None:
-                        contents.append(img_pil)
-                    cfg = types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.0,
-                        max_output_tokens=1500,
-                    )
-                    res = _GEMINI_CLIENT.models.generate_content(
-                        model=model_name, contents=contents, config=cfg
-                    )
-                    if res and res.text:
-                        raw_json = res.text
-                        break
-                except Exception as e:
-                    last_err = f"{model_name}: {str(e)[:60]}"
-                    continue
-
-        if not raw_json and img_pil is None:
-            raw_json = call_groq_text(contents_text)
-
-        if not raw_json:
-            raise RuntimeError(last_err or "Service temporarily busy")
-
-        data = extract_json(raw_json)
         RESULT_CACHE[key] = (time.time(), data)
         if len(RESULT_CACHE) > 200:
             RESULT_CACHE.pop(next(iter(RESULT_CACHE)))
 
         return data
     except Exception as e:
-        print(f"[BACKEND ERR]: {e}")
-        return {
-            "detected_type": "ERROR",
-            "cursor_pill": f"Err: {str(e)[:48]}",
-            "copy_value": "",
-            "expanded_note": str(e),
-            "pointer_xy": None,
-        }
+        return error_response(f"Err: {str(e)[:55]}", str(e))
