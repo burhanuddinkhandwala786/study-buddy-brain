@@ -29,10 +29,9 @@ COOLDOWN_SECS = 65
 
 # Updated to stable, currently supported model IDs to prevent 404 errors
 PREFERRED = [
-    "gemini-2.5-flash-lite",
-    "gemini-flash-lite-latest",
     "gemini-2.5-flash",
-    "gemini-flash-latest",
+    "gemini-1.5-flash",
+    "gemini-flash",
 ]
 BLOCKED_WORDS = [
     "embedding", "imagen", "veo", "aqa", "tts", "image",
