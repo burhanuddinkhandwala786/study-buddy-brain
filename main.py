@@ -18,34 +18,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CACHED_MODEL = None
+WORKING_MODEL = None
 
-def get_working_model(client):
-    global CACHED_MODEL
-    if CACHED_MODEL:
-        return CACHED_MODEL
-
-    available = []
-    for m in client.models.list():
-        actions = getattr(m, "supported_actions", []) or []
-        if "generateContent" in actions and "gemini" in m.name.lower():
-            # Strip 'models/' prefix if present
+def get_candidate_models(client):
+    candidates = [
+        "gemini-3-flash-preview",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+    ]
+    try:
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", []) or []
             name = m.name.replace("models/", "")
-            if "embedding" not in name and "imagen" not in name and "veo" not in name:
-                available.append(name)
+            if (
+                "generateContent" in actions
+                and "gemini" in name.lower()
+                and not any(x in name.lower() for x in ["embedding", "imagen", "veo", "aqa", "tts"])
+                and name not in candidates
+            ):
+                candidates.append(name)
+    except Exception:
+        pass
+    return candidates
 
-    # Prefer Flash models first for speed, otherwise fall back to any available Gemini model
-    for preferred in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3-flash-preview", "gemini-1.5-flash"]:
-        for name in available:
-            if preferred in name:
-                CACHED_MODEL = name
-                return CACHED_MODEL
+def call_gemini_with_fallback(client, contents):
+    global WORKING_MODEL
+    models_to_try = [WORKING_MODEL] if WORKING_MODEL else []
+    for m in get_candidate_models(client):
+        if m not in models_to_try:
+            models_to_try.append(m)
 
-    if available:
-        CACHED_MODEL = available[0]
-        return CACHED_MODEL
+    last_err = None
+    for model_name in models_to_try:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                ),
+            )
+            WORKING_MODEL = model_name
+            return response.text
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            # Only retry on 404 / model not found / unsupported model errors
+            if "404" in err_str or "NOT_FOUND" in err_str or "not found" in err_str.lower():
+                WORKING_MODEL = None
+                continue
+            raise e
 
-    raise RuntimeError("No generateContent Gemini models available on this API key.")
+    raise RuntimeError(f"All models failed. Last error: {last_err}")
 
 class AnalyzeRequest(BaseModel):
     image_base64: Optional[str] = None
@@ -53,12 +80,7 @@ class AnalyzeRequest(BaseModel):
 
 @app.get("/")
 def health():
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return {"status": "missing_key"}
-    client = genai.Client(api_key=api_key)
-    model = get_working_model(client)
-    return {"status": "ok", "active_model": model}
+    return {"status": "ok", "cached_working_model": WORKING_MODEL}
 
 @app.post("/analyze")
 def analyze_context(req: AnalyzeRequest):
@@ -74,7 +96,6 @@ def analyze_context(req: AnalyzeRequest):
 
     try:
         client = genai.Client(api_key=api_key)
-        model_name = get_working_model(client)
 
         prompt = """
         You are an ultra-fast, context-aware cursor intelligence. Analyze the input strictly by context and return valid JSON with keys:
@@ -100,15 +121,8 @@ def analyze_context(req: AnalyzeRequest):
         else:
             return {"detected_type": "ERROR", "cursor_pill": "Empty input", "copy_value": "", "expanded_note": "", "pointer_xy": None}
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1,
-            ),
-        )
-        return json.loads(response.text)
+        raw_json = call_gemini_with_fallback(client, contents)
+        return json.loads(raw_json)
     except Exception as e:
         return {
             "detected_type": "ERROR",
