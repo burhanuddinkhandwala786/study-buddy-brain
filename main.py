@@ -45,8 +45,8 @@ class AnalyzeRequest(BaseModel):
 def health():
     return {
         "status": "ok",
-        "system": "multi-provider-enterprise-live",
-        "providers_configured": {
+        "system": "triple-redundancy-enterprise-live",
+        "providers": {
             "gemini": bool(os.environ.get("GEMINI_API_KEY")),
             "groq": bool(os.environ.get("GROQ_API_KEY")),
             "openrouter": bool(os.environ.get("OPENROUTER_API_KEY"))
@@ -77,7 +77,7 @@ def call_groq(prompt_text, image_b64=None):
         "max_tokens": 2048
     }
 
-    with httpx.Client(timeout=25.0) as client:
+    with httpx.Client(timeout=30.0) as client:
         res = client.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers)
         if res.status_code != 200:
             raise RuntimeError(f"Groq HTTP {res.status_code}: {res.text}")
@@ -113,7 +113,7 @@ def call_openrouter(prompt_text, image_b64=None):
         "max_tokens": 2048
     }
 
-    with httpx.Client(timeout=25.0) as client:
+    with httpx.Client(timeout=30.0) as client:
         res = client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
         if res.status_code != 200:
             raise RuntimeError(f"OpenRouter HTTP {res.status_code}: {res.text}")
@@ -125,9 +125,6 @@ def call_openrouter(prompt_text, image_b64=None):
 def analyze_context(req: AnalyzeRequest):
     try:
         gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-        openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-
         contents_text = ""
         img_pil = None
         raw_key = ""
@@ -163,7 +160,7 @@ def analyze_context(req: AnalyzeRequest):
         last_error = None
 
         # --- TIER 1: Gemini 2.5 Flash ---
-        if gemini_key and not raw_json:
+        if gemini_key:
             try:
                 client = genai.Client(api_key=gemini_key)
                 contents = [PROMPT, contents_text]
@@ -184,30 +181,8 @@ def analyze_context(req: AnalyzeRequest):
             except Exception as e:
                 last_error = f"Gemini 2.5 failed: {e}"
 
-        # --- TIER 2: Gemini 1.5 Flash ---
-        if gemini_key and not raw_json:
-            try:
-                client = genai.Client(api_key=gemini_key)
-                contents = [PROMPT, contents_text]
-                if img_pil is not None:
-                    contents.append(img_pil)
-                
-                response = client.models.generate_content(
-                    model="gemini-1.5-flash",
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.0,
-                        max_output_tokens=2048
-                    )
-                )
-                if response and response.text:
-                    raw_json = response.text
-            except Exception as e:
-                last_error = f"{last_error} | Gemini 1.5 failed: {e}"
-
-        # --- TIER 3: Groq Llama 3.3 70B ---
-        if groq_key and not raw_json:
+        # --- TIER 2: Groq Llama 3.3 70B ---
+        if not raw_json:
             try:
                 img_b64_str = None
                 if img_pil:
@@ -218,8 +193,8 @@ def analyze_context(req: AnalyzeRequest):
             except Exception as e:
                 last_error = f"{last_error} | Groq failed: {e}"
 
-        # --- TIER 4: OpenRouter ---
-        if openrouter_key and not raw_json:
+        # --- TIER 3: OpenRouter Redundancy ---
+        if not raw_json:
             try:
                 img_b64_str = None
                 if img_pil:
@@ -228,10 +203,7 @@ def analyze_context(req: AnalyzeRequest):
                     img_b64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
                 raw_json = call_openrouter(contents_text, img_b64_str)
             except Exception as e:
-                last_error = f"{last_error} | OpenRouter failed: {e}"
-
-        if not raw_json:
-            raise RuntimeError(f"All 4 AI provider tiers failed. Summary: {last_error}")
+                raise RuntimeError(f"All 3 enterprise AI tiers failed. Last errors: {last_error} | OpenRouter: {e}")
 
         # Strict JSON cleaning & sanitization
         cleaned = raw_json.strip()
@@ -244,7 +216,7 @@ def analyze_context(req: AnalyzeRequest):
         if isinstance(data, list) and data:
             data = data[0]
 
-        # Ensure all required keys exist to prevent client-side crashes
+        # Defensive keys assignment to guarantee zero client-side crashes
         data.setdefault("detected_type", "DIRECT_VALUE")
         data.setdefault("cursor_pill", "Solution ready")
         data.setdefault("copy_value", "")
