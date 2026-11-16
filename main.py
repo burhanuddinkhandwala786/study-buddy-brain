@@ -44,7 +44,6 @@ class AnalyzeRequest(BaseModel):
 def parse_json(txt):
     if not txt:
         raise ValueError("Empty response from model")
-    # Strip markdown code fences if present
     cleaned = re.sub(r"^```json\s*", "", txt.strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r"^```\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
@@ -76,7 +75,8 @@ def call_gemini(user_text, img=None):
     if img is not None:
         contents.append(img)
         
-    models_to_try = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite"]
+    # Use standard stable Gemini 2.5 Flash model
+    models_to_try = ["gemini-2.5-flash"]
     last_err = None
     
     for model in models_to_try:
@@ -95,7 +95,7 @@ def call_gemini(user_text, img=None):
             last_err = e
             continue
             
-    raise RuntimeError(f"Gemini models failed: {str(last_err)}")
+    raise RuntimeError(f"Gemini failed: {str(last_err)}")
 
 def call_groq(user_text):
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -129,7 +129,6 @@ def health():
         "status": "ok",
         "gemini": bool(os.environ.get("GEMINI_API_KEY")),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
-        "openrouter": bool(os.environ.get("OPENROUTER_API_KEY")),
     }
 
 def error_response(msg, detail=""):
@@ -175,11 +174,10 @@ def analyze(req: AnalyzeRequest):
         sol = None
         status = "single"
         
-        # Try Gemini first
+        # Try Gemini first, fallback to Groq if needed
         try:
             sol = call_gemini(text_in, img)
         except Exception as gemini_err:
-            # Fallback to Groq if Gemini fails
             try:
                 sol = call_groq(text_in)
                 status = "fallback-groq"
