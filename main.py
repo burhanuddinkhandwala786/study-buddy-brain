@@ -121,14 +121,18 @@ def call_groq(prompt_text: str, image_b64: Optional[str] = None) -> str:
             {"role": "user", "content": prompt_text},
         ]
 
-    res = _HTTP_CLIENT.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        json={"model": model_id, "messages": messages, "temperature": 0.0, "max_tokens": 600},
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
-    if res.status_code != 200:
+    for attempt in range(3):
+        res = _HTTP_CLIENT.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json={"model": model_id, "messages": messages, "temperature": 0.0, "max_tokens": 600},
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
+        if res.status_code == 200:
+            return res.json()["choices"][0]["message"]["content"]
+        if res.status_code == 429 and attempt < 2:
+            time.sleep(1.5 * (attempt + 1))
+            continue
         raise RuntimeError(f"Groq {res.status_code}: {res.text[:100]}")
-    return res.json()["choices"][0]["message"]["content"]
 
 
 @app.post("/analyze")
@@ -189,7 +193,21 @@ def analyze_context(req: AnalyzeRequest):
                         raw_json = res.text
                         break
                 except Exception as e:
-                    last_err = f"{model_name}: {str(e)[:60]}"
+                    if "thinking" in str(e).lower():
+                        try:
+                            cfg_plain = types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                temperature=0.0,
+                                max_output_tokens=1200,
+                            )
+                            res = _GEMINI_CLIENT.models.generate_content(model=model_name, contents=contents, config=cfg_plain)
+                            if res and res.text:
+                                raw_json = res.text
+                                break
+                        except Exception as e2:
+                            last_err = f"{model_name}: {str(e2)[:60]}"
+                    else:
+                        last_err = f"{model_name}: {str(e)[:60]}"
                     if "403" in last_err or "PERMISSION_DENIED" in last_err or "free tier" in last_err.lower():
                         break
                     continue
