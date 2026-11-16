@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import time
+import hashlib
 from io import BytesIO
 from PIL import Image
 from fastapi import FastAPI
@@ -21,6 +22,10 @@ app.add_middleware(
 
 WORKING_MODEL = None
 _CANDIDATES = {"models": [], "ts": 0}
+COOLDOWN = {}      # model name -> unix time until which we skip it (after a 429)
+RESULT_CACHE = {}  # input hash -> (timestamp, result), so repeat captures cost nothing
+CACHE_TTL = 600
+COOLDOWN_SECS = 65
 
 # "-latest" aliases are maintained by Google and don't get retired like pinned names.
 PREFERRED = [
@@ -86,7 +91,12 @@ def call_gemini_with_fallback(client, contents):
             models_to_try.append(m)
 
     last_err = None
-    for model_name in models_to_try[:8]:  # cap attempts so a request can't hang forever
+    now = time.time()
+    ready = [m for m in models_to_try if COOLDOWN.get(m, 0) <= now]
+    if not ready:
+        raise RuntimeError("Rate limited. Wait a minute and try again")
+
+    for model_name in ready[:8]:  # cap attempts so a request can't hang forever
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -99,7 +109,10 @@ def call_gemini_with_fallback(client, contents):
             return response.text
         except Exception as e:
             last_err = e
-            if is_model_problem(str(e)):
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                COOLDOWN[model_name] = time.time() + COOLDOWN_SECS
+            if is_model_problem(err_str):
                 if model_name == WORKING_MODEL:
                     WORKING_MODEL = None
                 continue
@@ -168,12 +181,19 @@ def analyze_context(req: AnalyzeRequest):
         contents = [PROMPT]
         if req.image_base64:
             clean_b64 = req.image_base64.split(",")[-1]
+            key = hashlib.md5(clean_b64.encode()).hexdigest()
             img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
+            img.thumbnail((1280, 1280))  # smaller image = fewer tokens = less quota used
             contents.append(img)
         elif req.text_content:
+            key = hashlib.md5(req.text_content.encode()).hexdigest()
             contents.append(f"Selected text:\n{req.text_content}")
         else:
             return error_response("Empty input")
+
+        hit = RESULT_CACHE.get(key)
+        if hit and time.time() - hit[0] < CACHE_TTL:
+            return hit[1]
 
         raw_json = call_gemini_with_fallback(client, contents)
 
@@ -182,6 +202,9 @@ def analyze_context(req: AnalyzeRequest):
         data = json.loads(cleaned)
         if isinstance(data, list) and data:
             data = data[0]
+        RESULT_CACHE[key] = (time.time(), data)
+        if len(RESULT_CACHE) > 200:
+            RESULT_CACHE.pop(next(iter(RESULT_CACHE)))
         return data
     except Exception as e:
         return error_response(f"Err: {str(e)[:55]}", str(e))
