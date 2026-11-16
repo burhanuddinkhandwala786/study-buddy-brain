@@ -32,6 +32,7 @@ PREFERRED = [
     "gemini-2.5-flash",
     "gemini-1.5-flash",
     "gemini-flash",
+    "gemini-flash-latest",
 ]
 BLOCKED_WORDS = [
     "embedding", "imagen", "veo", "aqa", "tts", "image",
