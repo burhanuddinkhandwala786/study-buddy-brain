@@ -22,24 +22,24 @@ app.add_middleware(
 
 WORKING_MODEL = None
 _CANDIDATES = {"models": [], "ts": 0}
-COOLDOWN = {}      # model name -> unix time until which we skip it (after a 429)
-RESULT_CACHE = {}  # input hash -> (timestamp, result), so repeat captures cost nothing
+COOLDOWN = {}       # model_name -> unix timestamp when cooldown ends
+RESULT_CACHE = {}   # md5_hash -> (timestamp, response_dict)
 CACHE_TTL = 600
 COOLDOWN_SECS = 65
 
-# "-latest" aliases are maintained by Google and don't get retired like pinned names.
 PREFERRED = [
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
 ]
-BLOCKED_WORDS = ["embedding", "imagen", "veo", "aqa", "tts", "image", "live",
-                 "audio", "robotics", "computer-use", "learnlm", "gemma"]
+BLOCKED_WORDS = [
+    "embedding", "imagen", "veo", "aqa", "tts", "image",
+    "live", "audio", "robotics", "computer-use", "learnlm", "gemma"
+]
 
 
 def get_candidate_models(client):
-    # Cache the model list for 1 hour so we don't hit models.list() on every request
     if _CANDIDATES["models"] and time.time() - _CANDIDATES["ts"] < 3600:
         return _CANDIDATES["models"]
 
@@ -59,8 +59,6 @@ def get_candidate_models(client):
         pass
 
     if available:
-        # Only keep preferred models that this API key can actually see,
-        # then fall back to anything else that's available (flash first, newest first).
         ordered = [m for m in PREFERRED if m in available]
         rest = sorted(
             [m for m in available if m not in ordered],
@@ -68,7 +66,6 @@ def get_candidate_models(client):
         )
         ordered += rest
     else:
-        # models.list() failed, so just try the preferred names blindly
         ordered = list(PREFERRED)
 
     _CANDIDATES["models"] = ordered
@@ -78,9 +75,14 @@ def get_candidate_models(client):
 
 def is_model_problem(err_str: str) -> bool:
     s = err_str.lower()
-    return any(k in s for k in ["404", "not_found", "not found", "no longer available",
-                                "deprecated", "is not supported", "429", "resource_exhausted",
-                                "503", "unavailable", "overloaded"])
+    return any(
+        k in s
+        for k in [
+            "404", "not_found", "not found", "no longer available",
+            "deprecated", "is not supported", "429", "resource_exhausted",
+            "503", "unavailable", "overloaded"
+        ]
+    )
 
 
 def call_gemini_with_fallback(client, contents):
@@ -94,17 +96,35 @@ def call_gemini_with_fallback(client, contents):
     now = time.time()
     ready = [m for m in models_to_try if COOLDOWN.get(m, 0) <= now]
     if not ready:
-        raise RuntimeError("Rate limited. Wait a minute and try again")
+        raise RuntimeError("Rate limited. Wait 60s and try again.")
 
-    for model_name in ready[:8]:  # cap attempts so a request can't hang forever
+    for model_name in ready[:8]:
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
-            )
+            cfg_kwargs = {
+                "response_mime_type": "application/json",
+                "temperature": 0.0,
+            }
+            if "2.5" in model_name or "flash" in model_name:
+                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**cfg_kwargs),
+                )
+            except Exception as inner_e:
+                # Fallback if specific model rejects thinking_config
+                if "thinking" in str(inner_e).lower():
+                    cfg_kwargs.pop("thinking_config", None)
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(**cfg_kwargs),
+                    )
+                else:
+                    raise inner_e
+
             WORKING_MODEL = model_name
             return response.text
         except Exception as e:
@@ -118,9 +138,8 @@ def call_gemini_with_fallback(client, contents):
                 continue
             raise
 
-    # Everything failed: force a fresh model list next time
     _CANDIDATES["ts"] = 0
-    raise RuntimeError(f"All models failed. Last error: {last_err}")
+    raise RuntimeError(f"All models failed: {last_err}")
 
 
 class AnalyzeRequest(BaseModel):
@@ -128,14 +147,13 @@ class AnalyzeRequest(BaseModel):
     text_content: Optional[str] = None
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok", "cached_working_model": WORKING_MODEL}
 
 
 @app.get("/models")
 def list_models():
-    """Debug endpoint: shows which models your API key can actually use."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         return {"error": "GEMINI_API_KEY not set"}
@@ -143,7 +161,7 @@ def list_models():
     return {"candidates": get_candidate_models(client)}
 
 
-def error_response(msg, detail=""):
+def error_response(msg: str, detail: str = ""):
     return {
         "detected_type": "ERROR",
         "cursor_pill": msg,
@@ -154,18 +172,18 @@ def error_response(msg, detail=""):
 
 
 PROMPT = """
-You are an ultra-fast, context-aware cursor intelligence. Analyze the input strictly by context and return valid JSON with keys:
+You are an ultra-fast, high-precision cursor intelligence. Before answering, silently verify all facts, signs, units, and option letters against the exact text or diagram shown so there are zero careless errors. Return valid JSON with keys:
 - "detected_type": "MCQ" | "DIRECT_VALUE" | "CODE_FIX" | "UI_GUIDE" | "CONCEPT_EXPLAIN"
-- "cursor_pill": Ultra-short answer displayed directly on the user's cursor.
+- "cursor_pill": Ultra-short verified answer displayed directly on the user's cursor.
   * If MCQ: ONLY the exact option letter and text (e.g., "B) Half-wave dipole"). Zero explanation.
-  * If Numerical / Fill-in-blank: ONLY the exact final value/unit.
+  * If Numerical / Fill-in-blank: ONLY the exact final verified value/unit.
   * If Code error: ONLY the corrected line of code.
   * If UI/Software screen asking how/where to do something: 1-line instruction (e.g., "Click Export -> PDF").
   * If Open-ended theory/diagram: 1 crisp sentence core takeaway.
 - "copy_value": The clean raw value/code/answer to auto-copy to clipboard (empty string for MCQs).
 - "expanded_note": If CONCEPT_EXPLAIN or UI_GUIDE, give a concise 3-bullet step-by-step guide; otherwise "".
 - "pointer_xy": If UI_GUIDE and a specific button/icon is visible in the image, return [x, y] normalized from 0 to 1000; otherwise null.
-If the screen contains several questions, answer the one closest to the cursor, or the first one if unclear.
+If the screen contains several questions, answer the one closest to the center/cursor, or the first uncompleted one.
 """
 
 
@@ -177,13 +195,13 @@ def analyze_context(req: AnalyzeRequest):
 
     try:
         client = genai.Client(api_key=api_key)
-
         contents = [PROMPT]
+
         if req.image_base64:
             clean_b64 = req.image_base64.split(",")[-1]
             key = hashlib.md5(clean_b64.encode()).hexdigest()
             img = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-            img.thumbnail((1280, 1280))  # smaller image = fewer tokens = less quota used
+            img.thumbnail((800, 800))
             contents.append(img)
         elif req.text_content:
             key = hashlib.md5(req.text_content.encode()).hexdigest()
@@ -196,15 +214,21 @@ def analyze_context(req: AnalyzeRequest):
             return hit[1]
 
         raw_json = call_gemini_with_fallback(client, contents)
-
-        # Strip code fences if the model adds them, and handle a list-wrapped reply
-        cleaned = raw_json.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        cleaned = (
+            raw_json.strip()
+            .removeprefix("```json")
+            .removeprefix("```")
+            .removesuffix("```")
+            .strip()
+        )
         data = json.loads(cleaned)
         if isinstance(data, list) and data:
             data = data[0]
+
         RESULT_CACHE[key] = (time.time(), data)
         if len(RESULT_CACHE) > 200:
             RESULT_CACHE.pop(next(iter(RESULT_CACHE)))
+
         return data
     except Exception as e:
         return error_response(f"Err: {str(e)[:55]}", str(e))
