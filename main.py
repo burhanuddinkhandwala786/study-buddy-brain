@@ -108,12 +108,10 @@ def call_gemini_with_fallback(client, contents, deep_think: bool = False):
 
     for model_name in ready[:4]:
         try:
-            # Minimum allowed deadline by Google API is 10s
             cfg_kwargs = {
                 "response_mime_type": "application/json",
                 "temperature": 0.0,
                 "max_output_tokens": 750 if deep_think else 200,
-                "http_options": {"timeout": 12},
             }
             if "2.5" in model_name and "lite" not in model_name:
                 cfg_kwargs["thinking_config"] = types.ThinkingConfig(
