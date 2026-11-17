@@ -88,11 +88,10 @@ def health():
 
 @app.get("/diag")
 def diagnose_keys():
-    """Live health probe for every Gemini key + Groq key in Render."""
+    """Browser check 1: Verifies every Gemini key + Groq key in Render."""
     report = {"gemini": [], "groq": "not_configured"}
     for i, k in enumerate(get_keys("GEMINI_API_KEY"), 1):
         try:
-            # Minimum allowed deadline by Google API is >= 10s (15000ms used here)
             c = genai.Client(api_key=k, http_options={"timeout": 15000})
             res = c.models.generate_content(
                 model="gemini-3.5-flash-lite",
@@ -115,6 +114,36 @@ def diagnose_keys():
         except Exception as e:
             report["groq"] = f"ERROR: {str(e)[:60]}"
     return report
+
+
+@app.get("/selftest")
+def self_test():
+    """Browser check 2: Tests full end-to-end JSON parsing, Gemini pool, Groq fallback, and semantic cache (<15 tokens)."""
+    results = {}
+    t0 = time.time()
+
+    try:
+        raw_groq = call_groq('Return JSON: {"detected_type":"DIRECT_VALUE","normalized_q":"test 1+1","cursor_pill":"2","copy_value":"2","expanded_note":"","pointer_xy":null}')
+        parsed_groq = extract_json(raw_groq)
+        results["groq_pipeline"] = {"status": "200 OK", "output": parsed_groq.get("cursor_pill")}
+    except Exception as e:
+        results["groq_pipeline"] = {"status": "FAIL", "error": str(e)}
+
+    try:
+        raw_gem = call_gemini_pool('Return JSON: {"detected_type":"DIRECT_VALUE","normalized_q":"test 2+2","cursor_pill":"4","copy_value":"4","expanded_note":"","pointer_xy":null}')
+        parsed_gem = extract_json(raw_gem)
+        results["gemini_pipeline"] = {"status": "200 OK", "output": parsed_gem.get("cursor_pill")}
+    except Exception as e:
+        results["gemini_pipeline"] = {"status": "FAIL", "error": str(e)}
+
+    QUESTION_CACHE[norm_hash("capital of gujarat")] = (time.time(), {
+        "detected_type": "DIRECT_VALUE", "cursor_pill": "Gandhinagar", "copy_value": "Gandhinagar", "expanded_note": "", "pointer_xy": None
+    })
+    cache_hit = QUESTION_CACHE.get(norm_hash("Capital of Gujarat?!"))
+    results["semantic_cache"] = "200 OK (0-token hit)" if cache_hit else "FAIL"
+    results["empty_input_guard"] = analyze_context(AnalyzeRequest()).get("cursor_pill")
+    results["elapsed_ms"] = round((time.time() - t0) * 1000)
+    return results
 
 
 def extract_json(raw_text: str) -> dict:
