@@ -30,7 +30,6 @@ CACHE_TTL = 3600
 KEY_COOLDOWN = {}
 _KEY_CYCLE = itertools.count()
 
-# Verified active models — accuracy-first order
 GEMINI_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
@@ -88,7 +87,6 @@ def health():
 
 @app.get("/diag")
 def diagnose_keys():
-    """Browser check 1: Verifies every Gemini key + Groq key in Render."""
     report = {"gemini": [], "groq": "not_configured"}
     for i, k in enumerate(get_keys("GEMINI_API_KEY"), 1):
         try:
@@ -118,7 +116,6 @@ def diagnose_keys():
 
 @app.get("/selftest")
 def self_test():
-    """Browser check 2: Tests full end-to-end JSON parsing, Gemini pool, Groq fallback, and semantic cache (<15 tokens)."""
     results = {}
     t0 = time.time()
 
@@ -295,22 +292,14 @@ def analyze_context(req: AnalyzeRequest):
         raw_json = None
         errors = []
 
-        # 1. Text queries -> Groq fast-path (keeps 100% of Gemini quota free for image scans)
-        if img_pil is None:
-            try:
-                raw_json = call_groq(contents_text, None)
-            except Exception as e:
-                errors.append(str(e))
+        # 1. Primary Engine (Both Text & Images): 3-Key Gemini 3.8 Flash -> 3.5 Flash-Lite Pool
+        try:
+            raw_json = call_gemini_pool(contents_text, img_pil, extra_key=req.user_api_key, deep=is_followup)
+        except Exception as e:
+            errors.append(str(e))
 
-        # 2. Primary Engine: Gemini 3.8 Flash -> 3.5 Flash-Lite pool
+        # 2. Automatic Failover: Groq (Text or Vision)
         if not raw_json:
-            try:
-                raw_json = call_gemini_pool(contents_text, img_pil, extra_key=req.user_api_key, deep=is_followup)
-            except Exception as e:
-                errors.append(str(e))
-
-        # 3. Vision Failover: Groq qwen3.8-27b
-        if not raw_json and img_b64_str:
             try:
                 raw_json = call_groq(contents_text, img_b64_str)
             except Exception as e:
