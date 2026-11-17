@@ -18,7 +18,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="3.2.0")
+app = FastAPI(title="Cursor Companion Brain", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,8 +30,7 @@ app.add_middleware(
 _HTTP_CLIENT = httpx.Client(timeout=18.0)
 
 IMAGE_CACHE = {}
-QUESTION_CACHE = {}
-CACHE_TTL = 3600
+CACHE_TTL = 600  # 10-minute exact-payload dedup only (prevents cross-user wrong answers)
 KEY_COOLDOWN = {}
 _KEY_CYCLE = itertools.count()
 
@@ -68,7 +67,7 @@ Solve step-by-step internally before outputting JSON:
 3. Match your verified answer to the exact option letter/number and text.
 
 Return ONLY valid JSON:
-{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","normalized_q":"lowercase core question text without option letters","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
+{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
 
 Rules:
 - MCQ: cursor_pill = exact option letter/number + text (e.g. "B. Sports"). copy_value="", expanded_note="".
@@ -83,11 +82,6 @@ def get_keys(env_name: str):
         for key in os.environ.get(env_name, "").split(",")
         if key.strip()
     ]
-
-
-def norm_hash(text: str) -> str:
-    clean = re.sub(r"[^a-z0-9]+", "", (text or "").lower())
-    return hashlib.md5(clean.encode()).hexdigest() if len(clean) >= 12 else ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -119,10 +113,10 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v3.2-byok-pool",
+        "engine": "v3.3-strict-byok",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
-        "cached_questions": len(QUESTION_CACHE),
+        "cached_items": len(IMAGE_CACHE),
         "active_cooldowns": sum(1 for exp in KEY_COOLDOWN.values() if exp > now),
     }
 
@@ -184,7 +178,7 @@ def self_test():
 
     try:
         raw_groq = call_groq(
-            'Return JSON: {"detected_type":"DIRECT_VALUE","normalized_q":"test 1+1","cursor_pill":"2","copy_value":"2","expanded_note":"","pointer_xy":null}'
+            'Return JSON: {"detected_type":"DIRECT_VALUE","cursor_pill":"2","copy_value":"2","expanded_note":"","pointer_xy":null}'
         )
         parsed_groq = extract_json(raw_groq)
         results["groq_pipeline"] = {
@@ -196,7 +190,7 @@ def self_test():
 
     try:
         raw_gemini = call_gemini_pool(
-            'Return JSON: {"detected_type":"DIRECT_VALUE","normalized_q":"test 2+2","cursor_pill":"4","copy_value":"4","expanded_note":"","pointer_xy":null}'
+            'Return JSON: {"detected_type":"DIRECT_VALUE","cursor_pill":"4","copy_value":"4","expanded_note":"","pointer_xy":null}'
         )
         parsed_gemini = extract_json(raw_gemini)
         results["gemini_pipeline"] = {
@@ -206,18 +200,15 @@ def self_test():
     except Exception as exc:
         results["gemini_pipeline"] = {"status": "FAIL", "error": str(exc)[:140]}
 
-    QUESTION_CACHE[norm_hash("capital of gujarat")] = (
-        time.time(),
-        {
-            "detected_type": "DIRECT_VALUE",
-            "cursor_pill": "Gandhinagar",
-            "copy_value": "Gandhinagar",
-            "expanded_note": "",
-            "pointer_xy": None,
-        },
+    # Verify BYOK isolation guard (ensures invalid personal key never leaks into shared pool)
+    byok_guard = analyze_context(
+        AnalyzeRequest(text_content="What is 2+2?", user_api_key="AIzaInvalidTestKey000")
     )
-    cache_hit = QUESTION_CACHE.get(norm_hash("Capital of Gujarat?!"))
-    results["semantic_cache"] = "200 OK (0-token hit)" if cache_hit else "FAIL"
+    results["byok_isolation_guard"] = {
+        "status": "200 OK" if byok_guard.get("key_source") == "BYOK" else "FAIL",
+        "message": byok_guard.get("cursor_pill"),
+    }
+
     results["empty_input_guard"] = analyze_context(AnalyzeRequest()).get("cursor_pill")
     results["elapsed_ms"] = round((time.time() - start_time) * 1000)
     return results
@@ -247,7 +238,13 @@ def _classify_gemini_error(error_text: str) -> str:
     lowered = error_text.lower()
     if "429" in error_text or "resource_exhausted" in lowered:
         return "rate_limit"
-    if "403" in error_text or "permission_denied" in lowered or "api_key_invalid" in lowered:
+    if (
+        "400" in error_text
+        or "403" in error_text
+        or "permission_denied" in lowered
+        or "api_key_invalid" in lowered
+        or "api key not valid" in lowered
+    ):
         return "forbidden"
     if "404" in error_text or "not_found" in lowered or "decommission" in lowered:
         return "model_unavailable"
@@ -295,25 +292,31 @@ def call_gemini_pool(
     extra_key: Optional[str] = None,
     deep: bool = False,
 ) -> str:
-    shared_keys = get_keys("GEMINI_API_KEY")
     now = time.time()
+    user_key = (extra_key or "").strip()
 
-    # Rotate shared keys cleanly (1 key per request -> preserves 3x quota instead of burning all 3 at once)
-    if shared_keys:
-        start_idx = next(_KEY_CYCLE) % len(shared_keys)
-        shared_keys = shared_keys[start_idx:] + shared_keys[:start_idx]
+    # Strict BYOK mode: uses ONLY the user's personal key and never touches the shared pool
+    if user_key:
+        models = GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS
+        last_err = "Personal API key failed"
+        for model_name in models:
+            use_thinking = deep and "lite" not in model_name
+            try:
+                return _try_one(user_key, model_name, prompt_text, img_pil, use_thinking)
+            except Exception as exc:
+                err_s = str(exc)
+                last_err = f"{model_name}: {err_s[:100]}"
+                if _classify_gemini_error(err_s) == "forbidden":
+                    raise RuntimeError("BYOK_INVALID: Invalid personal API key (Alt+K)")
+        raise RuntimeError(f"BYOK_LIMIT: {last_err}")
 
-    # BYOK (Bring Your Own Key) always runs first if provided by the user
-    ordered_keys = []
-    if extra_key and extra_key.strip():
-        ordered_keys.append(extra_key.strip())
-    for k in shared_keys:
-        if k not in ordered_keys:
-            ordered_keys.append(k)
-
-    if not ordered_keys:
+    # Shared Pool mode
+    shared_keys = get_keys("GEMINI_API_KEY")
+    if not shared_keys:
         raise RuntimeError("No Gemini keys configured")
 
+    start_idx = next(_KEY_CYCLE) % len(shared_keys)
+    ordered_keys = shared_keys[start_idx:] + shared_keys[:start_idx]
     models = GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS
     last_error = "Gemini pool cooling down"
 
@@ -392,9 +395,7 @@ def call_groq(prompt_text: str, img_b64: Optional[str] = None) -> str:
             if response.status_code == 200:
                 return response.json()["choices"][0]["message"]["content"]
 
-            response_text = response.text or ""
             last_error = f"Groq {model_id}: HTTP {response.status_code}"
-
             if response.status_code == 429:
                 KEY_COOLDOWN[cooldown_key] = time.time() + 30
             elif response.status_code in (400, 404):
@@ -411,6 +412,7 @@ def analyze_context(req: AnalyzeRequest):
         img_b64_str = None
         raw_key = ""
         is_followup = bool(req.follow_up and req.prior_context)
+        is_byok = bool(req.user_api_key and req.user_api_key.strip())
 
         if is_followup:
             contents_text = f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}"
@@ -432,11 +434,6 @@ def analyze_context(req: AnalyzeRequest):
         elif req.text_content:
             contents_text = f"Solve:\n{req.text_content}"
             raw_key = req.text_content
-            question_hash = norm_hash(req.text_content)
-            if question_hash and question_hash in QUESTION_CACHE:
-                cached_at, cached_result = QUESTION_CACHE[question_hash]
-                if time.time() - cached_at < CACHE_TTL:
-                    return cached_result
         else:
             return {
                 "detected_type": "ERROR",
@@ -444,17 +441,21 @@ def analyze_context(req: AnalyzeRequest):
                 "copy_value": "",
                 "expanded_note": "",
                 "pointer_xy": None,
+                "key_source": "BYOK" if is_byok else "POOL",
             }
 
+        # Exact-payload dedup only (prevents accidental double-press quota waste without cross-user sharing)
         cache_key = hashlib.md5(raw_key.encode()).hexdigest()
         image_hit = IMAGE_CACHE.get(cache_key)
-        if image_hit and time.time() - image_hit[0] < CACHE_TTL:
-            return image_hit[1]
+        if not is_followup and image_hit and time.time() - image_hit[0] < CACHE_TTL:
+            cached = dict(image_hit[1])
+            cached["key_source"] = "BYOK" if is_byok else "POOL"
+            return cached
 
         raw_json = None
         errors = []
 
-        # 1. Primary: BYOK key (if user entered one) -> Shared Gemini Pool
+        # 1. Primary: Strict BYOK key (if provided) -> Shared Gemini Pool
         try:
             raw_json = call_gemini_pool(
                 prompt_text=contents_text,
@@ -463,10 +464,29 @@ def analyze_context(req: AnalyzeRequest):
                 deep=is_followup,
             )
         except Exception as exc:
+            err_msg = str(exc)
+            if err_msg.startswith("BYOK_INVALID"):
+                return {
+                    "detected_type": "ERROR",
+                    "cursor_pill": "Invalid personal API key (Alt+K)",
+                    "copy_value": "",
+                    "expanded_note": "",
+                    "pointer_xy": None,
+                    "key_source": "BYOK",
+                }
+            if err_msg.startswith("BYOK_LIMIT"):
+                return {
+                    "detected_type": "ERROR",
+                    "cursor_pill": "Personal key rate-limited — retry",
+                    "copy_value": "",
+                    "expanded_note": "",
+                    "pointer_xy": None,
+                    "key_source": "BYOK",
+                }
             errors.append(f"Gemini: {exc}")
 
-        # 2. Automatic Failover: Groq
-        if not raw_json:
+        # 2. Automatic Failover: Groq (disabled in BYOK mode so personal keys stay 100% isolated)
+        if not raw_json and not is_byok:
             try:
                 raw_json = call_groq(contents_text, img_b64_str)
             except Exception as exc:
@@ -476,21 +496,10 @@ def analyze_context(req: AnalyzeRequest):
             raise RuntimeError(" | ".join(errors))
 
         result = extract_json(raw_json)
-        normalized_question = result.pop("normalized_q", "")
-
-        if not is_followup and normalized_question:
-            question_hash = norm_hash(normalized_question)
-            if question_hash:
-                if question_hash in QUESTION_CACHE:
-                    cached_at, cached_result = QUESTION_CACHE[question_hash]
-                    if time.time() - cached_at < CACHE_TTL:
-                        return cached_result
-                QUESTION_CACHE[question_hash] = (time.time(), result)
-                if len(QUESTION_CACHE) > 1000:
-                    QUESTION_CACHE.pop(next(iter(QUESTION_CACHE)))
+        result["key_source"] = "BYOK" if is_byok else "POOL"
 
         IMAGE_CACHE[cache_key] = (time.time(), result)
-        if len(IMAGE_CACHE) > 500:
+        if len(IMAGE_CACHE) > 300:
             IMAGE_CACHE.pop(next(iter(IMAGE_CACHE)))
 
         return result
@@ -503,4 +512,5 @@ def analyze_context(req: AnalyzeRequest):
             "copy_value": "",
             "expanded_note": "",
             "pointer_xy": None,
+            "key_source": "POOL",
         }
