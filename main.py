@@ -24,23 +24,29 @@ app.add_middleware(
 )
 
 _HTTP_CLIENT = httpx.Client(timeout=20.0)
-RESULT_CACHE = {}
-CACHE_TTL = 1800  # 30-min cache saves huge quota when users scan similar questions
+IMAGE_CACHE = {}
+QUESTION_CACHE = {}
+CACHE_TTL = 3600  # 1-hour shared cache across all users
 KEY_COOLDOWN = {}
 _KEY_CYCLE = itertools.count()
 
+# Accuracy-first order: always use strongest Flash reasoning model first so all users get identical 20/20 results
 GEMINI_MODELS = [
-    "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.6-flash",
-    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
 ]
 
-PROMPT = """You are an expert academic and technical verification engine.
-Verify formulas, option letters, and logical constraints carefully—never be misled by already-clicked radio buttons. Return ONLY valid JSON:
-{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
+PROMPT = """You are an elite academic, competitive-exam, and technical verification engine.
+Solve step-by-step internally before outputting JSON:
+1. Read the ENTIRE question carefully (watch for words like NOT, INCORRECT, EXCEPT, or unit conversions).
+2. Independently derive or verify the factual answer BEFORE looking at any highlighted/selected radio buttons in the screenshot.
+3. Match your verified answer to the exact option letter/number and text.
+
+Return ONLY valid JSON:
+{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","normalized_q":"lowercase core question text without option letters","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
 Rules:
-- MCQ: cursor_pill = exact option letter/number + text (e.g. "4. Bharuch"). copy_value="", expanded_note="".
+- MCQ: cursor_pill = exact option letter/number + text (e.g. "B. Sports"). copy_value="", expanded_note="".
 - DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer/fixed line; copy_value = same raw value; expanded_note="".
 - LONG_ANSWER: cursor_pill = short title; copy_value & expanded_note = complete structured breakdown.
 - CONCEPT_EXPLAIN: cursor_pill = 1-line summary; expanded_note = 3 high-yield bullet points."""
@@ -50,24 +56,27 @@ def get_keys(env_name: str):
     return [k.strip() for k in os.environ.get(env_name, "").split(",") if k.strip()]
 
 
+def norm_hash(text: str) -> str:
+    clean = re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+    return hashlib.md5(clean.encode()).hexdigest() if len(clean) >= 12 else ""
+
+
 class AnalyzeRequest(BaseModel):
     image_base64: Optional[str] = None
     text_content: Optional[str] = None
     follow_up: Optional[str] = None
     prior_context: Optional[str] = None
-    user_api_key: Optional[str] = None  # Supports BYOK in v2
+    user_api_key: Optional[str] = None
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {
         "status": "ok",
-        "providers": {
-            "gemini_keys": len(get_keys("GEMINI_API_KEY")),
-            "groq_keys": len(get_keys("GROQ_API_KEY")),
-            "nvidia_nim": bool(get_keys("NVIDIA_API_KEY")),
-            "openrouter": any(k.startswith("sk-or-") for k in get_keys("OPENROUTER_API_KEY")),
-        },
+        "engine": "consistency-v3.8",
+        "gemini_keys": len(get_keys("GEMINI_API_KEY")),
+        "groq_keys": len(get_keys("GROQ_API_KEY")),
+        "cached_questions": len(QUESTION_CACHE),
     }
 
 
@@ -100,14 +109,14 @@ def call_gemini_pool(prompt_text: str, img_pil: Optional[Image.Image] = None, ex
     for idx, api_key in enumerate(ordered_keys):
         if KEY_COOLDOWN.get(api_key, 0) > now:
             continue
-        client = genai.Client(api_key=api_key, http_options={"timeout": 16000})
+        client = genai.Client(api_key=api_key, http_options={"timeout": 18000})
         for model_name in GEMINI_MODELS:
             contents = [PROMPT, prompt_text] + ([img_pil] if img_pil is not None else [])
             try:
                 cfg = types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.0,
-                    max_output_tokens=1000,
+                    max_output_tokens=1100,
                     thinking_config=types.ThinkingConfig(thinking_level="low"),
                 )
                 res = client.models.generate_content(model=model_name, contents=contents, config=cfg)
@@ -123,7 +132,7 @@ def call_gemini_pool(prompt_text: str, img_pil: Optional[Image.Image] = None, ex
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
                                 temperature=0.0,
-                                max_output_tokens=1000,
+                                max_output_tokens=1100,
                             ),
                         )
                         if res and res.text:
@@ -179,38 +188,42 @@ def analyze_context(req: AnalyzeRequest):
         img_pil = None
         img_b64_str = None
         raw_key = ""
+        is_followup = bool(req.follow_up and req.prior_context)
 
-        if req.follow_up and req.prior_context:
+        if is_followup:
             contents_text = f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}"
             raw_key = contents_text
         elif req.image_base64:
             clean_b64 = req.image_base64.split(",")[-1]
             raw_key = hashlib.md5(clean_b64.encode()).hexdigest()
             img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-            img_pil.thumbnail((640, 640), Image.BILINEAR)
+            img_pil.thumbnail((720, 720), Image.LANCZOS)
 
             small_img = img_pil.copy()
             small_img.thumbnail((420, 420), Image.BILINEAR)
             buf = BytesIO()
-            small_img.save(buf, format="JPEG", quality=62)
+            small_img.save(buf, format="JPEG", quality=65)
             img_b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
 
             contents_text = "Solve the problem shown in this image accurately."
         elif req.text_content:
             contents_text = f"Solve:\n{req.text_content}"
             raw_key = req.text_content
+            q_hash = norm_hash(req.text_content)
+            if q_hash and q_hash in QUESTION_CACHE and time.time() - QUESTION_CACHE[q_hash][0] < CACHE_TTL:
+                return QUESTION_CACHE[q_hash][1]
         else:
             return {"detected_type": "ERROR", "cursor_pill": "Select text or snip area first", "copy_value": "", "expanded_note": "", "pointer_xy": None}
 
         key = hashlib.md5(raw_key.encode()).hexdigest()
-        hit = RESULT_CACHE.get(key)
+        hit = IMAGE_CACHE.get(key)
         if hit and time.time() - hit[0] < CACHE_TTL:
             return hit[1]
 
         raw_json = None
         errors = []
 
-        # 1. Text fast-path -> Groq (preserves Gemini quota for images)
+        # 1. Text fast-path -> Groq (preserves 100% of Gemini quota for image scans)
         if img_pil is None:
             for gkey in get_keys("GROQ_API_KEY"):
                 try:
@@ -219,15 +232,15 @@ def analyze_context(req: AnalyzeRequest):
                 except Exception as e:
                     errors.append(f"Groq-text: {e}")
 
-        # 2. Gemini 3.5-Flash-Lite / 3.8-Flash Key Pool
+        # 2. Primary Image Engine: Gemini 3.8 Flash -> 3.6 Flash -> 3.5 Flash-Lite
         if not raw_json:
             try:
                 raw_json = call_gemini_pool(contents_text, img_pil, extra_key=req.user_api_key)
             except Exception as e:
                 errors.append(str(e))
 
-        # 3. Groq Vision Backup
-        if not raw_json:
+        # 3. Vision Failover: Groq -> NVIDIA NIM -> OpenRouter
+        if not raw_json and img_b64_str:
             for gkey in get_keys("GROQ_API_KEY"):
                 try:
                     raw_json = call_openai_compat("https://api.groq.com/openai/v1", gkey, "qwen/qwen3.8-27b", contents_text, img_b64_str)
@@ -235,7 +248,6 @@ def analyze_context(req: AnalyzeRequest):
                 except Exception as e:
                     errors.append(f"Groq-vis: {e}")
 
-        # 4. NVIDIA NIM Free Backup (build.nvidia.com)
         if not raw_json:
             for nkey in get_keys("NVIDIA_API_KEY"):
                 try:
@@ -245,7 +257,6 @@ def analyze_context(req: AnalyzeRequest):
                 except Exception as e:
                     errors.append(f"NVIDIA: {e}")
 
-        # 5. OpenRouter Free Models Backup
         if not raw_json:
             for okey in [k for k in get_keys("OPENROUTER_API_KEY") if k.startswith("sk-or-")]:
                 try:
@@ -259,9 +270,20 @@ def analyze_context(req: AnalyzeRequest):
             raise RuntimeError(" | ".join(errors))
 
         data = extract_json(raw_json)
-        RESULT_CACHE[key] = (time.time(), data)
-        if len(RESULT_CACHE) > 500:
-            RESULT_CACHE.pop(next(iter(RESULT_CACHE)))
+        norm_q = data.pop("normalized_q", "")
+        if not is_followup and norm_q:
+            q_hash = norm_hash(norm_q)
+            if q_hash:
+                if q_hash in QUESTION_CACHE and time.time() - QUESTION_CACHE[q_hash][0] < CACHE_TTL:
+                    # Serve consistent cached answer across all friends for identical questions
+                    return QUESTION_CACHE[q_hash][1]
+                QUESTION_CACHE[q_hash] = (time.time(), data)
+                if len(QUESTION_CACHE) > 1000:
+                    QUESTION_CACHE.pop(next(iter(QUESTION_CACHE)))
+
+        IMAGE_CACHE[key] = (time.time(), data)
+        if len(IMAGE_CACHE) > 500:
+            IMAGE_CACHE.pop(next(iter(IMAGE_CACHE)))
 
         return data
     except Exception as e:
