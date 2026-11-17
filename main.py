@@ -30,11 +30,17 @@ CACHE_TTL = 3600
 KEY_COOLDOWN = {}
 _KEY_CYCLE = itertools.count()
 
-# Verified active models (Nov 2026) — accuracy-first order
+# Verified active models — accuracy-first order
 GEMINI_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.5-flash",
+]
+
+GROQ_TEXT_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
 ]
 
 PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
@@ -82,15 +88,16 @@ def health():
 
 @app.get("/diag")
 def diagnose_keys():
-    """Live 1-second health probe for every Gemini key + Groq key in Render."""
+    """Live health probe for every Gemini key + Groq key in Render."""
     report = {"gemini": [], "groq": "not_configured"}
     for i, k in enumerate(get_keys("GEMINI_API_KEY"), 1):
         try:
-            c = genai.Client(api_key=k, http_options={"timeout": 8000})
+            # Minimum allowed deadline by Google API is >= 10s (15000ms used here)
+            c = genai.Client(api_key=k, http_options={"timeout": 15000})
             res = c.models.generate_content(
                 model="gemini-3.5-flash-lite",
                 contents="Reply OK",
-                config=types.GenerateContentConfig(max_output_tokens=5),
+                config=types.GenerateContentConfig(max_output_tokens=10),
             )
             report["gemini"].append({"key": f"G{i} (...{k[-4:]})", "status": "HEALTHY", "reply": (res.text or "").strip()})
         except Exception as e:
@@ -101,10 +108,10 @@ def diagnose_keys():
         try:
             r = _HTTP_CLIENT.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": "OK"}], "max_tokens": 5},
+                json={"model": GROQ_TEXT_MODELS[0], "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 10},
                 headers={"Authorization": f"Bearer {gkeys[0]}", "Content-Type": "application/json"},
             )
-            report["groq"] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}"
+            report["groq"] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}: {r.text[:80]}"
         except Exception as e:
             report["groq"] = f"ERROR: {str(e)[:60]}"
     return report
@@ -139,7 +146,7 @@ def call_gemini_pool(prompt_text: str, img_pil: Optional[Image.Image] = None, ex
     for idx, api_key in enumerate(ordered_keys):
         if KEY_COOLDOWN.get(api_key, 0) > now:
             continue
-        client = genai.Client(api_key=api_key, http_options={"timeout": 18000})
+        client = genai.Client(api_key=api_key, http_options={"timeout": 20000})
         for model_name in GEMINI_MODELS:
             contents = [PROMPT, prompt_text] + ([img_pil] if img_pil is not None else [])
             level = "medium" if deep else ("low" if "3.8" in model_name else "minimal")
@@ -187,32 +194,33 @@ def call_groq(prompt_text: str, img_b64: Optional[str] = None) -> str:
     if not keys:
         raise RuntimeError("No Groq keys")
 
-    if img_b64:
-        model_id = "qwen/qwen3.8-27b"
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": f"{PROMPT}\n\n{prompt_text}"},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-            ],
-        }]
-    else:
-        model_id = "llama-3.3-70b-versatile"
-        messages = [
-            {"role": "system", "content": PROMPT},
-            {"role": "user", "content": prompt_text},
-        ]
-
+    models_to_try = ["qwen/qwen3.8-27b"] if img_b64 else GROQ_TEXT_MODELS
     last_err = "Groq busy"
+
     for gkey in keys:
-        res = _HTTP_CLIENT.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            json={"model": model_id, "messages": messages, "temperature": 0.0, "max_tokens": 700},
-            headers={"Authorization": f"Bearer {gkey}", "Content-Type": "application/json"},
-        )
-        if res.status_code == 200:
-            return res.json()["choices"][0]["message"]["content"]
-        last_err = f"Groq {res.status_code}"
+        for model_id in models_to_try:
+            if img_b64:
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"{PROMPT}\n\n{prompt_text}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    ],
+                }]
+            else:
+                messages = [
+                    {"role": "system", "content": PROMPT},
+                    {"role": "user", "content": prompt_text},
+                ]
+
+            res = _HTTP_CLIENT.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json={"model": model_id, "messages": messages, "temperature": 0.0, "max_tokens": 700},
+                headers={"Authorization": f"Bearer {gkey}", "Content-Type": "application/json"},
+            )
+            if res.status_code == 200:
+                return res.json()["choices"][0]["message"]["content"]
+            last_err = f"Groq {model_id}: HTTP {res.status_code}"
     raise RuntimeError(last_err)
 
 
