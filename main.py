@@ -26,21 +26,21 @@ app.add_middleware(
 _HTTP_CLIENT = httpx.Client(timeout=20.0)
 IMAGE_CACHE = {}
 QUESTION_CACHE = {}
-CACHE_TTL = 3600  # 1-hour shared cache across all users
+CACHE_TTL = 3600
 KEY_COOLDOWN = {}
 _KEY_CYCLE = itertools.count()
 
-# Accuracy-first order: always use strongest Flash reasoning model first so all users get identical 20/20 results
+# Verified active models (Nov 2026) — accuracy-first order
 GEMINI_MODELS = [
     "gemini-3.8-flash",
-    "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
 ]
 
-PROMPT = """You are an elite academic, competitive-exam, and technical verification engine.
+PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
 Solve step-by-step internally before outputting JSON:
-1. Read the ENTIRE question carefully (watch for words like NOT, INCORRECT, EXCEPT, or unit conversions).
-2. Independently derive or verify the factual answer BEFORE looking at any highlighted/selected radio buttons in the screenshot.
+1. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
+2. Independently verify the factual or mathematical answer BEFORE looking at any highlighted/selected radio buttons.
 3. Match your verified answer to the exact option letter/number and text.
 
 Return ONLY valid JSON:
@@ -73,11 +73,41 @@ class AnalyzeRequest(BaseModel):
 def health():
     return {
         "status": "ok",
-        "engine": "consistency-v3.8",
+        "engine": "v2-precision-3.8",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "cached_questions": len(QUESTION_CACHE),
     }
+
+
+@app.get("/diag")
+def diagnose_keys():
+    """Live 1-second health probe for every Gemini key + Groq key in Render."""
+    report = {"gemini": [], "groq": "not_configured"}
+    for i, k in enumerate(get_keys("GEMINI_API_KEY"), 1):
+        try:
+            c = genai.Client(api_key=k, http_options={"timeout": 8000})
+            res = c.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents="Reply OK",
+                config=types.GenerateContentConfig(max_output_tokens=5),
+            )
+            report["gemini"].append({"key": f"G{i} (...{k[-4:]})", "status": "HEALTHY", "reply": (res.text or "").strip()})
+        except Exception as e:
+            report["gemini"].append({"key": f"G{i} (...{k[-4:]})", "status": "ERROR", "reason": str(e)[:90]})
+
+    gkeys = get_keys("GROQ_API_KEY")
+    if gkeys:
+        try:
+            r = _HTTP_CLIENT.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": "OK"}], "max_tokens": 5},
+                headers={"Authorization": f"Bearer {gkeys[0]}", "Content-Type": "application/json"},
+            )
+            report["groq"] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}"
+        except Exception as e:
+            report["groq"] = f"ERROR: {str(e)[:60]}"
+    return report
 
 
 def extract_json(raw_text: str) -> dict:
@@ -96,8 +126,8 @@ def extract_json(raw_text: str) -> dict:
     return data
 
 
-def call_gemini_pool(prompt_text: str, img_pil: Optional[Image.Image] = None, extra_key: Optional[str] = None) -> str:
-    keys = ([extra_key] if extra_key else []) + get_keys("GEMINI_API_KEY")
+def call_gemini_pool(prompt_text: str, img_pil: Optional[Image.Image] = None, extra_key: Optional[str] = None, deep: bool = False) -> str:
+    keys = ([extra_key.strip()] if extra_key and extra_key.strip() else []) + get_keys("GEMINI_API_KEY")
     if not keys:
         raise RuntimeError("No Gemini keys")
 
@@ -112,12 +142,13 @@ def call_gemini_pool(prompt_text: str, img_pil: Optional[Image.Image] = None, ex
         client = genai.Client(api_key=api_key, http_options={"timeout": 18000})
         for model_name in GEMINI_MODELS:
             contents = [PROMPT, prompt_text] + ([img_pil] if img_pil is not None else [])
+            level = "medium" if deep else ("low" if "3.8" in model_name else "minimal")
             try:
                 cfg = types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.0,
                     max_output_tokens=1100,
-                    thinking_config=types.ThinkingConfig(thinking_level="low"),
+                    thinking_config=types.ThinkingConfig(thinking_level=level),
                 )
                 res = client.models.generate_content(model=model_name, contents=contents, config=cfg)
                 if res and res.text:
@@ -144,15 +175,20 @@ def call_gemini_pool(prompt_text: str, img_pil: Optional[Image.Image] = None, ex
                 if "429" in err_s or "RESOURCE_EXHAUSTED" in err_s:
                     KEY_COOLDOWN[api_key] = time.time() + 35
                     break
-                if "403" in err_s or "PERMISSION_DENIED" in err_s:
-                    KEY_COOLDOWN[api_key] = time.time() + 3600
+                if "403" in err_s or "PERMISSION_DENIED" in err_s or "free tier" in err_s.lower():
+                    KEY_COOLDOWN[api_key] = time.time() + 86400
                     break
                 continue
     raise RuntimeError(last_err)
 
 
-def call_openai_compat(base_url: str, api_key: str, model_id: str, prompt_text: str, img_b64: Optional[str] = None) -> str:
+def call_groq(prompt_text: str, img_b64: Optional[str] = None) -> str:
+    keys = get_keys("GROQ_API_KEY")
+    if not keys:
+        raise RuntimeError("No Groq keys")
+
     if img_b64:
+        model_id = "qwen/qwen3.8-27b"
         messages = [{
             "role": "user",
             "content": [
@@ -161,24 +197,23 @@ def call_openai_compat(base_url: str, api_key: str, model_id: str, prompt_text: 
             ],
         }]
     else:
+        model_id = "llama-3.3-70b-versatile"
         messages = [
             {"role": "system", "content": PROMPT},
             {"role": "user", "content": prompt_text},
         ]
 
-    res = _HTTP_CLIENT.post(
-        f"{base_url}/chat/completions",
-        json={"model": model_id, "messages": messages, "temperature": 0.0, "max_tokens": 700},
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://cursor-companion.app",
-            "X-Title": "Cursor Companion",
-        },
-    )
-    if res.status_code != 200:
-        raise RuntimeError(f"HTTP {res.status_code}")
-    return res.json()["choices"][0]["message"]["content"]
+    last_err = "Groq busy"
+    for gkey in keys:
+        res = _HTTP_CLIENT.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json={"model": model_id, "messages": messages, "temperature": 0.0, "max_tokens": 700},
+            headers={"Authorization": f"Bearer {gkey}", "Content-Type": "application/json"},
+        )
+        if res.status_code == 200:
+            return res.json()["choices"][0]["message"]["content"]
+        last_err = f"Groq {res.status_code}"
+    raise RuntimeError(last_err)
 
 
 @app.post("/analyze")
@@ -197,7 +232,7 @@ def analyze_context(req: AnalyzeRequest):
             clean_b64 = req.image_base64.split(",")[-1]
             raw_key = hashlib.md5(clean_b64.encode()).hexdigest()
             img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-            img_pil.thumbnail((720, 720), Image.LANCZOS)
+            img_pil.thumbnail((760, 760), Image.LANCZOS)
 
             small_img = img_pil.copy()
             small_img.thumbnail((420, 420), Image.BILINEAR)
@@ -223,48 +258,26 @@ def analyze_context(req: AnalyzeRequest):
         raw_json = None
         errors = []
 
-        # 1. Text fast-path -> Groq (preserves 100% of Gemini quota for image scans)
+        # 1. Text queries -> Groq fast-path (keeps 100% of Gemini quota free for image scans)
         if img_pil is None:
-            for gkey in get_keys("GROQ_API_KEY"):
-                try:
-                    raw_json = call_openai_compat("https://api.groq.com/openai/v1", gkey, "llama-3.3-70b-versatile", contents_text)
-                    break
-                except Exception as e:
-                    errors.append(f"Groq-text: {e}")
-
-        # 2. Primary Image Engine: Gemini 3.8 Flash -> 3.6 Flash -> 3.5 Flash-Lite
-        if not raw_json:
             try:
-                raw_json = call_gemini_pool(contents_text, img_pil, extra_key=req.user_api_key)
+                raw_json = call_groq(contents_text, None)
             except Exception as e:
                 errors.append(str(e))
 
-        # 3. Vision Failover: Groq -> NVIDIA NIM -> OpenRouter
+        # 2. Primary Engine: Gemini 3.8 Flash -> 3.5 Flash-Lite pool
+        if not raw_json:
+            try:
+                raw_json = call_gemini_pool(contents_text, img_pil, extra_key=req.user_api_key, deep=is_followup)
+            except Exception as e:
+                errors.append(str(e))
+
+        # 3. Vision Failover: Groq qwen3.8-27b
         if not raw_json and img_b64_str:
-            for gkey in get_keys("GROQ_API_KEY"):
-                try:
-                    raw_json = call_openai_compat("https://api.groq.com/openai/v1", gkey, "qwen/qwen3.8-27b", contents_text, img_b64_str)
-                    break
-                except Exception as e:
-                    errors.append(f"Groq-vis: {e}")
-
-        if not raw_json:
-            for nkey in get_keys("NVIDIA_API_KEY"):
-                try:
-                    n_model = "meta/llama-3.2-90b-vision-instruct" if img_b64_str else "meta/llama-3.3-70b-instruct"
-                    raw_json = call_openai_compat("https://integrate.api.nvidia.com/v1", nkey, n_model, contents_text, img_b64_str)
-                    break
-                except Exception as e:
-                    errors.append(f"NVIDIA: {e}")
-
-        if not raw_json:
-            for okey in [k for k in get_keys("OPENROUTER_API_KEY") if k.startswith("sk-or-")]:
-                try:
-                    o_model = "nvidia/nemotron-3.5-super-vl:free" if img_b64_str else "nvidia/nemotron-3-ultra-550b-a55b:free"
-                    raw_json = call_openai_compat("https://openrouter.ai/api/v1", okey, o_model, contents_text, img_b64_str)
-                    break
-                except Exception as e:
-                    errors.append(f"OR: {e}")
+            try:
+                raw_json = call_groq(contents_text, img_b64_str)
+            except Exception as e:
+                errors.append(str(e))
 
         if not raw_json:
             raise RuntimeError(" | ".join(errors))
@@ -275,7 +288,6 @@ def analyze_context(req: AnalyzeRequest):
             q_hash = norm_hash(norm_q)
             if q_hash:
                 if q_hash in QUESTION_CACHE and time.time() - QUESTION_CACHE[q_hash][0] < CACHE_TTL:
-                    # Serve consistent cached answer across all friends for identical questions
                     return QUESTION_CACHE[q_hash][1]
                 QUESTION_CACHE[q_hash] = (time.time(), data)
                 if len(QUESTION_CACHE) > 1000:
