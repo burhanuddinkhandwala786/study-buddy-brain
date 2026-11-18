@@ -19,7 +19,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="4.4.0")
+app = FastAPI(title="Cursor Companion Brain", version="4.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,13 +28,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_HTTP_CLIENT = httpx.Client(timeout=10.0)
+_HTTP_CLIENT = httpx.Client(timeout=8.5)
 
 IMAGE_CACHE = {}
-CACHE_TTL = 900  # 15-minute exact screenshot/payload dedup
+CACHE_TTL = 900
 
 QUIZ_CACHE = {}
-QUIZ_CACHE_TTL = 1800  # 30-minute normalized question dedup across V1, V2 & V3
+QUIZ_CACHE_TTL = 1800
 
 KEY_COOLDOWN = {}
 _KEY_CYCLE = itertools.count()
@@ -42,9 +42,8 @@ _KEY_CYCLE = itertools.count()
 _GEMINI_CLIENTS = {}
 _GEMINI_CLIENTS_LOCK = threading.Lock()
 _DB_LOCK = threading.Lock()
-_DB_PATH = "/tmp/companion_brain_cache.db"
+_DB_PATH = "/tmp/companion_brain_cache_v3.db"
 
-# Distinct Gemini model buckets so 3 keys = 9 independent daily/minute quota pools
 GEMINI_FAST_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
@@ -52,15 +51,16 @@ GEMINI_FAST_MODELS = [
 ]
 
 GEMINI_VISION_MODELS = [
+    "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
 ]
 
+# Non-reasoning fast models FIRST so zero "The user wants to..." monologue ever leaks
 GROQ_TEXT_MODELS = [
-    "openai/gpt-oss-120b",
     "llama-3.3-70b-versatile",
-    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
 ]
 
 GROQ_VISION_MODELS = [
@@ -88,65 +88,42 @@ OPENROUTER_VISION_MODELS = [
     "nvidia/nemotron-3.5-super-vl:free",
 ]
 
-PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
-Solve step-by-step internally before outputting JSON:
-1. If multiple questions appear in a screenshot, focus ONLY on the primary/centered question.
-2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
-3. Independently calculate or verify the exact factual answer BEFORE looking at any pre-selected radio buttons or highlights.
-4. Double-check your math/logic, then match your verified answer to the exact option letter/number and text.
-
-Return ONLY valid JSON:
+PROMPT = """You are an elite academic and competitive-exam answer engine.
+Output ONLY a single raw JSON object (no markdown, no explanation outside JSON):
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"","pointer_xy":null}
 
-Strict Output Rules:
-- IF ANY OPTIONS (A/B/C/D or 1/2/3/4) ARE PRESENT: You MUST set detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. A is correct R is wrong"), copy_value="", expanded_note="". NEVER output a long paragraph when options exist.
-- DIRECT_VALUE / CODE_FIX (no options present): cursor_pill = concise verified answer or fixed code line; copy_value = raw answer; expanded_note="".
-- CONCEPT_EXPLAIN (only when user explicitly asks "explain" or "why" in follow-up): cursor_pill = 1-line summary; expanded_note = 2 short bullet points.
-- COMPOUND OPTIONS CHECK: Before finalizing any MCQ, check ALL options through E) for "both A and B", "both B and C", "all of the above", or "none of the above". If two individual options are valid and a combined option exists, you MUST select the combined option (e.g. "D. both b and c")."""
+Strict Rules:
+1. Read ALL options (A/B/C/D/E or 1/2/3/4) before answering.
+2. COMPOUND OPTIONS CHECK: Check if an option says "both A and B", "both B and C", "all of the above", or "none of the above". If two individual options are true and a combined option exists, you MUST pick the combined option (e.g. "D. both b and c").
+3. IF OPTIONS ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. VAX" or "D. both b and c"), copy_value="", expanded_note="".
+4. DIRECT_VALUE / CODE_FIX: cursor_pill = exact concise answer; copy_value = raw answer; expanded_note=""."""
 
-
-V3_SOLVE_PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
-Solve step-by-step internally before outputting JSON:
-1. If multiple questions appear in a screenshot, focus ONLY on the primary/centered question.
-2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
-3. Independently calculate or verify the exact factual answer BEFORE looking at any pre-selected radio buttons or highlights.
-4. Match your verified answer to the exact option letter/number and text.
-
-Return ONLY valid JSON:
+V3_SOLVE_PROMPT = """You are an elite academic and competitive-exam answer engine.
+Output ONLY a single raw JSON object (no markdown, no thinking text outside JSON):
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high"|"medium","pointer_xy":null}
 
-Rules:
-- IF ANY OPTIONS (A/B/C/D or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. A is correct R is wrong"), copy_value="", expanded_note = 1-sentence reason for sidecar history.
-- DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer or fixed code line; copy_value = same raw value; expanded_note = 1-sentence verification note.
-- CONCEPT_EXPLAIN: cursor_pill = crisp 1-line takeaway; copy_value = takeaway; expanded_note = 3 concise bullet points.
-- COMPOUND OPTIONS CHECK: Before finalizing any MCQ, check ALL options through E) for "both A and B", "both B and C", "all of the above", or "none of the above". If two individual options are valid and a combined option exists, you MUST select the combined option (e.g. "D. both b and c")."""
+Strict Rules:
+1. Read ALL options (A/B/C/D/E or 1/2/3/4) before answering.
+2. COMPOUND OPTIONS CHECK: Check if an option says "both A and B", "both B and C", "all of the above", or "none of the above". If two individual options are true and a combined option exists, you MUST pick the combined option (e.g. "D. both b and c").
+3. IF OPTIONS ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. VAX"), copy_value="", expanded_note = 1 short sentence explaining why.
+4. DIRECT_VALUE / CODE_FIX: cursor_pill = exact concise answer; copy_value = raw answer; expanded_note = 1 short sentence."""
 
-V3_REWRITE_PROMPT = """You are a sharp, natural executive writing assistant.
-Rewrite or craft a crisp, polite, professional reply for the provided text without fluff.
-Return ONLY valid JSON:
+V3_REWRITE_PROMPT = """Rewrite the provided text clearly and politely.
+Output ONLY a single raw JSON object:
 {"detected_type":"REWRITE","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
-Rules:
-- cursor_pill = concise 1-line preview of the polished rewrite (max 70 chars).
-- copy_value = complete ready-to-paste polished text.
-- expanded_note = brief note on tone improvement."""
+Rules: cursor_pill = 1-line preview (max 65 chars); copy_value = complete rewritten text; expanded_note = brief tone note."""
 
-V3_EXPLAIN_PROMPT = """You are an expert technical and academic tutor.
-Explain the provided concept, code snippet, or error clearly in plain English.
-Return ONLY valid JSON:
+V3_EXPLAIN_PROMPT = """Explain the provided concept, code, or error clearly in plain English.
+Output ONLY a single raw JSON object:
 {"detected_type":"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
-Rules:
-- cursor_pill = single crisp 1-line summary (max 75 chars).
-- copy_value = same 1-line summary.
-- expanded_note = 3 high-yield bullet points for the study sidecar."""
+Rules: cursor_pill = 1-line takeaway (max 70 chars); copy_value = same takeaway; expanded_note = 3 short bullet points."""
 
 
 def _init_db():
     try:
         with _DB_LOCK:
             conn = sqlite3.connect(_DB_PATH)
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS qcache (qhash TEXT PRIMARY KEY, ts REAL, payload TEXT)"
-            )
+            conn.execute("CREATE TABLE IF NOT EXISTS qcache (qhash TEXT PRIMARY KEY, ts REAL, payload TEXT)")
             conn.commit()
             conn.close()
     except Exception:
@@ -199,7 +176,7 @@ def get_keys(env_name: str):
 def parse_user_keys(raw_user_keys: Optional[str]):
     return [
         key.strip().strip('"').strip("'")
-        for key in (raw_user_keys or "").split(",")
+        for key in re.split(r"[\s,;]+", raw_user_keys or "")
         if key.strip().strip('"').strip("'")
     ]
 
@@ -219,10 +196,15 @@ def detect_key_provider(api_key: str) -> str:
 
 
 def normalize_quiz_hash(text: str) -> str:
-    s = re.sub(r"^\s*(?:q(?:uestion)?\s*\d+[\.\)\:\-]*|\d+[\.\)\:\-]+|\[\d+\s*marks?\])\s*", "", (text or "").strip(), flags=re.I)
+    s = re.sub(
+        r"^\s*(?:q(?:uestion)?\s*\d+[\.\)\:\-]*|\d+[\.\)\:\-]+|\[\d+\s*marks?\])\s*",
+        "",
+        (text or "").strip(),
+        flags=re.I,
+    )
     words = re.findall(r"[a-z0-9]+", s.lower())
     cleaned = "".join(words)
-    return hashlib.md5(cleaned.encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
+    return hashlib.md5(f"v3:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -244,10 +226,7 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                client = genai.Client(
-                    api_key=api_key,
-                    http_options={"timeout": 12000},
-                )
+                client = genai.Client(api_key=api_key, http_options={"timeout": 9000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
 
@@ -258,7 +237,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v4.4-quota-multiplier",
+        "engine": "v4.5-fast-clean-json",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
@@ -270,12 +249,7 @@ def health():
 
 @app.get("/diag")
 def diagnose_keys():
-    report = {
-        "gemini": [],
-        "groq": "not_configured",
-        "nvidia": "not_configured",
-        "openrouter": "not_configured",
-    }
+    report = {"gemini": [], "groq": "not_configured", "nvidia": "not_configured", "openrouter": "not_configured"}
 
     for index, api_key in enumerate(get_keys("GEMINI_API_KEY"), 1):
         try:
@@ -297,82 +271,31 @@ def diagnose_keys():
                 "reason": str(exc)[:120],
             })
 
-    groq_keys = get_keys("GROQ_API_KEY")
-    if groq_keys:
-        try:
-            response = _HTTP_CLIENT.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                json={
-                    "model": GROQ_TEXT_MODELS[0],
-                    "messages": [{"role": "user", "content": "Reply OK"}],
-                    "max_tokens": 10,
-                },
-                headers={
-                    "Authorization": f"Bearer {groq_keys[0]}",
-                    "Content-Type": "application/json",
-                },
-            )
-            report["groq"] = (
-                "HEALTHY"
-                if response.status_code == 200
-                else f"HTTP {response.status_code}: {response.text[:120]}"
-            )
-        except Exception as exc:
-            report["groq"] = f"ERROR: {str(exc)[:120]}"
-
-    nv_keys = get_keys("NVIDIA_API_KEY")
-    if nv_keys:
-        try:
-            response = _HTTP_CLIENT.post(
-                "https://integrate.api.nvidia.com/v1/chat/completions",
-                json={
-                    "model": NVIDIA_TEXT_MODELS[0],
-                    "messages": [{"role": "user", "content": "Reply OK"}],
-                    "max_tokens": 10,
-                },
-                headers={
-                    "Authorization": f"Bearer {nv_keys[0]}",
-                    "Content-Type": "application/json",
-                },
-            )
-            report["nvidia"] = (
-                "HEALTHY"
-                if response.status_code == 200
-                else f"HTTP {response.status_code}: {response.text[:120]}"
-            )
-        except Exception as exc:
-            report["nvidia"] = f"ERROR: {str(exc)[:120]}"
-
-    or_keys = get_keys("OPENROUTER_API_KEY")
-    if or_keys:
-        try:
-            response = _HTTP_CLIENT.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                json={
-                    "model": OPENROUTER_TEXT_MODELS[0],
-                    "messages": [{"role": "user", "content": "Reply OK"}],
-                    "max_tokens": 10,
-                },
-                headers={
-                    "Authorization": f"Bearer {or_keys[0]}",
-                    "Content-Type": "application/json",
-                },
-            )
-            report["openrouter"] = (
-                "HEALTHY"
-                if response.status_code == 200
-                else f"HTTP {response.status_code}: {response.text[:120]}"
-            )
-        except Exception as exc:
-            report["openrouter"] = f"ERROR: {str(exc)[:120]}"
+    for tag, env_name, url, model in [
+        ("groq", "GROQ_API_KEY", "https://api.groq.com/openai/v1/chat/completions", GROQ_TEXT_MODELS[0]),
+        ("nvidia", "NVIDIA_API_KEY", "https://integrate.api.nvidia.com/v1/chat/completions", NVIDIA_TEXT_MODELS[0]),
+        ("openrouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1/chat/completions", OPENROUTER_TEXT_MODELS[0]),
+    ]:
+        keys = get_keys(env_name)
+        if keys:
+            try:
+                r = _HTTP_CLIENT.post(
+                    url,
+                    json={"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 10},
+                    headers={"Authorization": f"Bearer {keys[0]}", "Content-Type": "application/json"},
+                )
+                report[tag] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}: {r.text[:100]}"
+            except Exception as exc:
+                report[tag] = f"ERROR: {str(exc)[:100]}"
 
     return report
 
 
 @app.get("/selftest")
+@app.get("/v3/selftest")
 def self_test():
     results = {}
-    start_time = time.time()
+    t0 = time.time()
 
     try:
         raw_groq = call_openai_compat(
@@ -382,10 +305,9 @@ def self_test():
             prompt_text='Return JSON: {"detected_type":"DIRECT_VALUE","cursor_pill":"2","copy_value":"2","expanded_note":"","pointer_xy":null}',
             provider_tag="groq",
         )
-        parsed_groq = extract_json(raw_groq)
-        results["groq_pipeline"] = {"status": "200 OK", "output": parsed_groq.get("cursor_pill")}
+        results["groq_pipeline"] = {"status": "200 OK", "output": extract_json(raw_groq).get("cursor_pill")}
     except Exception as exc:
-        results["groq_pipeline"] = {"status": "FAIL", "error": str(exc)[:140]}
+        results["groq_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
 
     try:
         raw_gemini = call_gemini_keys(
@@ -393,24 +315,31 @@ def self_test():
             prompt_text='Return JSON: {"detected_type":"DIRECT_VALUE","cursor_pill":"4","copy_value":"4","expanded_note":"","pointer_xy":null}',
             is_byok=False,
         )
-        parsed_gemini = extract_json(raw_gemini)
-        results["gemini_pipeline"] = {"status": "200 OK", "output": parsed_gemini.get("cursor_pill")}
+        results["gemini_pipeline"] = {"status": "200 OK", "output": extract_json(raw_gemini).get("cursor_pill")}
     except Exception as exc:
-        results["gemini_pipeline"] = {"status": "FAIL", "error": str(exc)[:140]}
+        results["gemini_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
 
     mock_check = v3_analyze_context(V3AnalyzeRequest(text_content="TEST: UI alignment check"))
     results["zero_token_test_mode"] = {
         "status": "200 OK (0 tokens)" if mock_check.get("key_source") == "TEST" else "FAIL",
         "pill": mock_check.get("cursor_pill"),
     }
-
-    results["elapsed_ms"] = round((time.time() - start_time) * 1000)
+    results["elapsed_ms"] = round((time.time() - t0) * 1000)
     return results
 
 
-@app.get("/v3/selftest")
-def v3_self_test():
-    return self_test()
+_THOUGHT_PREFIXES = (
+    "the user",
+    "let's",
+    "let us",
+    "okay",
+    "first,",
+    "we need",
+    "to solve",
+    "analyzing",
+    "step 1",
+    "thinking",
+)
 
 
 def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
@@ -423,27 +352,29 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
 
     data = None
 
+    # 1. Direct JSON parse
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, list) and parsed:
             parsed = parsed[0]
-        if isinstance(parsed, dict):
+        if isinstance(parsed, dict) and "cursor_pill" in parsed:
             data = parsed
     except Exception:
         pass
 
+    # 2. Scan ALL JSON objects and pick the LAST valid one containing "cursor_pill" (avoids thinking examples)
     if data is None:
         decoder = json.JSONDecoder()
         for idx, ch in enumerate(cleaned):
             if ch == "{":
                 try:
                     obj, _ = decoder.raw_decode(cleaned[idx:])
-                    if isinstance(obj, dict) and ("cursor_pill" in obj or "detected_type" in obj):
+                    if isinstance(obj, dict) and "cursor_pill" in obj:
                         data = obj
-                        break
                 except Exception:
                     continue
 
+    # 3. Regex extraction of cursor_pill
     if data is None:
         pill_match = re.search(r'"cursor_pill"\s*:\s*"([^"]+)"', cleaned)
         if pill_match:
@@ -459,25 +390,32 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
                 "pointer_xy": None,
             }
 
+    # 4. Reject internal monologue leakage ("The user wants to...") so model fails over cleanly
     if not isinstance(data, dict):
         lines = [
             ln.strip().lstrip("*-•").strip()
             for ln in cleaned.splitlines()
-            if ln.strip() and not ln.strip().startswith("{") and not ln.strip().startswith("}")
+            if ln.strip()
+            and not ln.strip().startswith(("{", "}", '"'))
+            and not ln.strip().lower().startswith(_THOUGHT_PREFIXES)
         ]
         if not lines:
-            raise ValueError("Could not parse response")
-        first_line = lines[0][:85]
+            raise ValueError("Monologue output without JSON")
+        first_line = lines[0][:80]
         data = {
             "detected_type": "DIRECT_VALUE",
             "cursor_pill": first_line,
             "copy_value": first_line,
-            "expanded_note": " ".join(lines[:3])[:260] if preserve_notes else "",
+            "expanded_note": " ".join(lines[:3])[:240] if preserve_notes else "",
             "pointer_xy": None,
         }
 
+    pill_str = str(data.get("cursor_pill", "")).strip()
+    if not pill_str or pill_str.lower().startswith(_THOUGHT_PREFIXES):
+        raise ValueError("Invalid monologue cursor_pill")
+
     data.setdefault("detected_type", "DIRECT_VALUE")
-    data.setdefault("cursor_pill", "Done")
+    data["cursor_pill"] = pill_str
     data.setdefault("copy_value", "")
     data.setdefault("expanded_note", "")
     data.setdefault("pointer_xy", None)
@@ -492,12 +430,7 @@ def _classify_gemini_error(error_text: str) -> str:
     lowered = error_text.lower()
     if "429" in error_text or "resource_exhausted" in lowered or "quota" in lowered:
         return "rate_limit"
-    if (
-        "403" in error_text
-        or "permission_denied" in lowered
-        or "api_key_invalid" in lowered
-        or "api key not valid" in lowered
-    ):
+    if "403" in error_text or "permission_denied" in lowered or "api_key_invalid" in lowered or "api key not valid" in lowered:
         return "forbidden"
     if "404" in error_text or "not_found" in lowered or "decommission" in lowered:
         return "model_unavailable"
@@ -509,43 +442,21 @@ def _try_one_gemini(
     model_name: str,
     prompt_text: str,
     img_pil,
-    use_thinking: bool,
     sys_prompt: str = PROMPT,
 ) -> str:
-    cfg_kwargs = {
-        "response_mime_type": "application/json",
-        "temperature": 0.0,
-        "max_output_tokens": 850 if use_thinking else 500,
-    }
-    if use_thinking:
-        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
-
+    # Fast mode (no hidden thinking tokens) -> 0.5s - 1.1s latency
+    cfg = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        temperature=0.0,
+        max_output_tokens=340,
+    )
     client = _get_client(api_key)
     contents = [sys_prompt, prompt_text] + ([img_pil] if img_pil is not None else [])
-
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=contents,
-            config=types.GenerateContentConfig(**cfg_kwargs),
-        )
-        if response and response.text:
-            extract_json(response.text, preserve_notes=True)
-            return response.text
-        raise RuntimeError("empty response")
-    except Exception as exc:
-        error_text = str(exc)
-        if use_thinking and ("thinking" in error_text.lower() or "invalid_argument" in error_text.lower()):
-            cfg_kwargs.pop("thinking_config", None)
-            retry_response = client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(**cfg_kwargs),
-            )
-            if retry_response and retry_response.text:
-                extract_json(retry_response.text, preserve_notes=True)
-                return retry_response.text
-        raise
+    response = client.models.generate_content(model=model_name, contents=contents, config=cfg)
+    if response and response.text:
+        extract_json(response.text, preserve_notes=True)
+        return response.text
+    raise RuntimeError("empty response")
 
 
 def call_gemini_keys(
@@ -555,7 +466,7 @@ def call_gemini_keys(
     deep: bool = False,
     is_byok: bool = False,
     sys_prompt: str = PROMPT,
-    prefer_fast: bool = False,
+    prefer_fast: bool = True,
 ) -> str:
     if not keys:
         raise RuntimeError("No Gemini keys configured")
@@ -563,11 +474,10 @@ def call_gemini_keys(
     now = time.time()
     start_idx = next(_KEY_CYCLE) % len(keys)
     ordered_keys = keys[start_idx:] + keys[:start_idx]
-    models = GEMINI_FAST_MODELS if prefer_fast else (GEMINI_VISION_MODELS if (deep or img_pil is not None) else GEMINI_FAST_MODELS)
+    models = GEMINI_VISION_MODELS if img_pil is not None else GEMINI_FAST_MODELS
     last_error = "Gemini keys cooling down"
 
     for model_name in models:
-        use_thinking = (not prefer_fast) and (deep or img_pil is not None) and "lite" not in model_name
         for api_key in ordered_keys:
             if KEY_COOLDOWN.get(api_key, 0) > now:
                 continue
@@ -576,17 +486,14 @@ def call_gemini_keys(
                 continue
 
             try:
-                return _try_one_gemini(
-                    api_key, model_name, prompt_text, img_pil, use_thinking, sys_prompt=sys_prompt
-                )
+                return _try_one_gemini(api_key, model_name, prompt_text, img_pil, sys_prompt=sys_prompt)
             except Exception as exc:
                 error_text = str(exc)
-                last_error = f"{model_name}: {error_text[:120]}"
+                last_error = f"{model_name}: {error_text[:100]}"
                 err_type = _classify_gemini_error(error_text)
 
                 if err_type == "rate_limit":
-                    # Only cool down this specific key:model bucket so the key's other model buckets stay active
-                    KEY_COOLDOWN[model_cd_key] = time.time() + 35
+                    KEY_COOLDOWN[model_cd_key] = time.time() + 30
                 elif err_type == "forbidden":
                     KEY_COOLDOWN[api_key] = time.time() + 3600
                 elif err_type == "model_unavailable":
@@ -630,10 +537,7 @@ def call_openai_compat(
                 {"role": "user", "content": prompt_text},
             ]
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if provider_tag == "openrouter":
             headers["HTTP-Referer"] = "https://study-buddy-brain.onrender.com"
             headers["X-Title"] = "Cursor Companion"
@@ -642,7 +546,7 @@ def call_openai_compat(
             "model": model_id,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 600,
+            "max_tokens": 360,
         }
         if provider_tag == "groq" and not img_b64:
             payload_body["response_format"] = {"type": "json_object"}
@@ -650,17 +554,17 @@ def call_openai_compat(
         try:
             response = _HTTP_CLIENT.post(endpoint, json=payload_body, headers=headers)
         except Exception as exc:
-            last_error = f"{provider_tag} {model_id}: {str(exc)[:100]}"
+            last_error = f"{provider_tag} {model_id}: {str(exc)[:80]}"
             continue
 
         if response.status_code == 200:
             try:
-                content = response.json()["choices"][0]["message"]["content"]
-                if content:
+                content = response.json()["choices"][0]["message"].get("content") or ""
+                if content.strip():
                     extract_json(content, preserve_notes=True)
                     return content
             except Exception as parse_exc:
-                last_error = f"{provider_tag} {model_id} parse error: {str(parse_exc)[:80]}"
+                last_error = f"{provider_tag} {model_id}: {str(parse_exc)[:60]}"
                 continue
 
         if response.status_code == 400 and "response_format" in payload_body:
@@ -668,8 +572,8 @@ def call_openai_compat(
             try:
                 retry_res = _HTTP_CLIENT.post(endpoint, json=payload_body, headers=headers)
                 if retry_res.status_code == 200:
-                    content = retry_res.json()["choices"][0]["message"]["content"]
-                    if content:
+                    content = retry_res.json()["choices"][0]["message"].get("content") or ""
+                    if content.strip():
                         extract_json(content, preserve_notes=True)
                         return content
             except Exception:
@@ -689,98 +593,6 @@ def call_openai_compat(
     if is_byok:
         raise RuntimeError(f"BYOK_LIMIT: {last_error}")
     raise RuntimeError(last_error)
-
-
-def route_universal_byok(
-    user_keys: list,
-    prompt_text: str,
-    img_pil: Optional[Image.Image] = None,
-    img_b64: Optional[str] = None,
-    deep: bool = False,
-    sys_prompt: str = PROMPT,
-) -> str:
-    gemini_keys = [k for k in user_keys if detect_key_provider(k) == "gemini"]
-    groq_keys = [k for k in user_keys if detect_key_provider(k) == "groq"]
-    nvidia_keys = [k for k in user_keys if detect_key_provider(k) == "nvidia"]
-    openrouter_keys = [k for k in user_keys if detect_key_provider(k) == "openrouter"]
-    openai_keys = [k for k in user_keys if detect_key_provider(k) == "openai"]
-
-    if not (gemini_keys or groq_keys or nvidia_keys or openrouter_keys or openai_keys):
-        raise RuntimeError("BYOK_INVALID")
-
-    errors = []
-
-    if gemini_keys:
-        try:
-            return call_gemini_keys(
-                gemini_keys, prompt_text, img_pil, deep=deep, is_byok=True, sys_prompt=sys_prompt, prefer_fast=True
-            )
-        except Exception as exc:
-            errors.append(str(exc))
-
-    for nv_key in nvidia_keys:
-        try:
-            return call_openai_compat(
-                endpoint="https://integrate.api.nvidia.com/v1/chat/completions",
-                api_key=nv_key,
-                models=NVIDIA_VISION_MODELS if img_b64 else NVIDIA_TEXT_MODELS,
-                prompt_text=prompt_text,
-                img_b64=img_b64,
-                provider_tag="nvidia",
-                is_byok=True,
-                sys_prompt=sys_prompt,
-            )
-        except Exception as exc:
-            errors.append(str(exc))
-
-    for g_key in groq_keys:
-        try:
-            return call_openai_compat(
-                endpoint="https://api.groq.com/openai/v1/chat/completions",
-                api_key=g_key,
-                models=GROQ_VISION_MODELS if img_b64 else GROQ_TEXT_MODELS,
-                prompt_text=prompt_text,
-                img_b64=img_b64,
-                provider_tag="groq",
-                is_byok=True,
-                sys_prompt=sys_prompt,
-            )
-        except Exception as exc:
-            errors.append(str(exc))
-
-    for or_key in openrouter_keys:
-        try:
-            return call_openai_compat(
-                endpoint="https://openrouter.ai/api/v1/chat/completions",
-                api_key=or_key,
-                models=OPENROUTER_VISION_MODELS if img_b64 else OPENROUTER_TEXT_MODELS,
-                prompt_text=prompt_text,
-                img_b64=img_b64,
-                provider_tag="openrouter",
-                is_byok=True,
-                sys_prompt=sys_prompt,
-            )
-        except Exception as exc:
-            errors.append(str(exc))
-
-    for oa_key in openai_keys:
-        try:
-            return call_openai_compat(
-                endpoint="https://api.openai.com/v1/chat/completions",
-                api_key=oa_key,
-                models=["gpt-4o-mini"],
-                prompt_text=prompt_text,
-                img_b64=img_b64,
-                provider_tag="openai",
-                is_byok=True,
-                sys_prompt=sys_prompt,
-            )
-        except Exception as exc:
-            errors.append(str(exc))
-
-    if errors and all("BYOK_INVALID" in e for e in errors):
-        raise RuntimeError("BYOK_INVALID")
-    raise RuntimeError(" | ".join(errors) if errors else "BYOK_LIMIT")
 
 
 def _call_nvidia_pool(prompt_text: str, img_b64: Optional[str] = None, sys_prompt: str = PROMPT) -> Optional[str]:
@@ -834,7 +646,7 @@ def _run_shared_cascade(
     is_text_only = img_pil is None
 
     if is_text_only:
-        # Text Quota Shield: Groq -> Gemini Flash-Lite -> NVIDIA NIM -> OpenRouter Free
+        # Fast non-reasoning cascade: Groq Llama-3.3 -> Gemini Flash-Lite -> NVIDIA -> OpenRouter
         for g_key in get_keys("GROQ_API_KEY"):
             try:
                 raw_json = call_openai_compat(
@@ -871,7 +683,6 @@ def _run_shared_cascade(
         if raw_or:
             return raw_or
     else:
-        # Vision Quota Shield: Gemini Vision -> Groq Vision -> NVIDIA Vision -> OpenRouter Free Vision
         try:
             return call_gemini_keys(
                 keys=get_keys("GEMINI_API_KEY"),
@@ -880,7 +691,7 @@ def _run_shared_cascade(
                 deep=is_followup,
                 is_byok=False,
                 sys_prompt=sys_prompt,
-                prefer_fast=False,
+                prefer_fast=True,
             )
         except Exception as exc:
             errors.append(f"Gemini: {exc}")
@@ -913,11 +724,7 @@ def _run_shared_cascade(
     raise RuntimeError(" | ".join(errors) or "All providers busy")
 
 
-def _unified_execute(
-    req: AnalyzeRequest,
-    action_mode: str = "solve",
-    preserve_notes: bool = False,
-) -> dict:
+def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_notes: bool = False) -> dict:
     mode = (action_mode or "solve").strip().lower()
     sys_prompt = (
         V3_REWRITE_PROMPT
@@ -927,7 +734,6 @@ def _unified_execute(
         else (V3_SOLVE_PROMPT if preserve_notes else PROMPT)
     )
 
-    # Zero-token TEST mode so you can test UI, hotkeys, and builds without burning API quota
     txt = (req.text_content or "").strip()
     if txt.upper().startswith("TEST:") or (req.user_api_key or "").strip().lower() == "test":
         label = txt[5:].strip() or "Verified UI & Hotkey Check"
@@ -946,8 +752,6 @@ def _unified_execute(
     raw_key = ""
     quiz_hash = ""
     is_followup = bool(req.follow_up and req.prior_context)
-    user_keys = parse_user_keys(req.user_api_key)
-    is_byok = bool(user_keys)
 
     if is_followup:
         contents_text = f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}"
@@ -984,27 +788,25 @@ def _unified_execute(
             "copy_value": "",
             "expanded_note": "",
             "pointer_xy": None,
-            "key_source": "BYOK" if is_byok else "POOL",
+            "key_source": "POOL",
         }
 
-    # 1. Exact payload dedup (15 min)
-    cache_key = hashlib.md5(raw_key.encode()).hexdigest()
+    cache_key = hashlib.md5(f"v3:{raw_key}".encode()).hexdigest()
     image_hit = IMAGE_CACHE.get(cache_key)
     if not is_followup and image_hit and time.time() - image_hit[0] < CACHE_TTL:
         cached = dict(image_hit[1])
         if not preserve_notes:
             cached["expanded_note"] = ""
-        cached["key_source"] = "BYOK" if is_byok else "CACHE"
+        cached["key_source"] = "CACHE"
         return cached
 
-    # 2. Cross-user normalized quiz cache (Memory + 24h SQLite persistence across V1, V2 & V3)
     if not is_followup and quiz_hash:
         q_hit = QUIZ_CACHE.get(quiz_hash)
         if q_hit and (time.time() - q_hit[0] < QUIZ_CACHE_TTL):
             cached = dict(q_hit[1])
             if not preserve_notes:
                 cached["expanded_note"] = ""
-            cached["key_source"] = "BYOK" if is_byok else "CACHE"
+            cached["key_source"] = "CACHE"
             return cached
 
         db_hit = _db_get(quiz_hash)
@@ -1013,50 +815,20 @@ def _unified_execute(
             cached = dict(db_hit)
             if not preserve_notes:
                 cached["expanded_note"] = ""
-            cached["key_source"] = "BYOK" if is_byok else "CACHE"
+            cached["key_source"] = "CACHE"
             return cached
 
-    if is_byok:
-        try:
-            raw_json = route_universal_byok(
-                user_keys=user_keys,
-                prompt_text=contents_text,
-                img_pil=img_pil,
-                img_b64=img_b64_str,
-                deep=is_followup,
-                sys_prompt=sys_prompt,
-            )
-        except Exception as exc:
-            err_msg = str(exc)
-            if "BYOK_INVALID" in err_msg:
-                return {
-                    "detected_type": "ERROR",
-                    "cursor_pill": "Invalid key (AIza / gsk_ / nvapi / sk-)",
-                    "copy_value": "",
-                    "expanded_note": "",
-                    "pointer_xy": None,
-                    "key_source": "BYOK",
-                }
-            return {
-                "detected_type": "ERROR",
-                "cursor_pill": "Personal key busy — retry",
-                "copy_value": "",
-                "expanded_note": err_msg[:260],
-                "pointer_xy": None,
-                "key_source": "BYOK",
-            }
-    else:
-        raw_json = _run_shared_cascade(
-            contents_text=contents_text,
-            img_pil=img_pil,
-            img_b64_str=img_b64_str,
-            is_followup=is_followup,
-            sys_prompt=sys_prompt,
-        )
+    raw_json = _run_shared_cascade(
+        contents_text=contents_text,
+        img_pil=img_pil,
+        img_b64_str=img_b64_str,
+        is_followup=is_followup,
+        sys_prompt=sys_prompt,
+    )
 
     result = extract_json(raw_json, preserve_notes=True)
     confidence = result.pop("confidence", "high")
-    result["key_source"] = "BYOK" if is_byok else "POOL"
+    result["key_source"] = "POOL"
 
     IMAGE_CACHE[cache_key] = (time.time(), dict(result))
     if len(IMAGE_CACHE) > 400:
@@ -1074,9 +846,6 @@ def _unified_execute(
     return result
 
 
-# ==============================================================================
-# V1 / V2 LEGACY ROUTE (AUTO-BENEFITS FROM QUIZ DEDUP & 4-PROVIDER CASCADE)
-# ==============================================================================
 @app.post("/analyze")
 def analyze_context(req: AnalyzeRequest):
     try:
@@ -1093,9 +862,6 @@ def analyze_context(req: AnalyzeRequest):
         }
 
 
-# ==============================================================================
-# V3 SMART ROUTE (REWRITE / EXPLAIN / SIDECAR NOTES + SAME UNIFIED QUOTA ENGINE)
-# ==============================================================================
 @app.post("/v3/analyze")
 def v3_analyze_context(req: V3AnalyzeRequest):
     try:
