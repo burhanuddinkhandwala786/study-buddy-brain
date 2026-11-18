@@ -622,25 +622,17 @@ def route_universal_byok(
 
     last_err = "BYOK_LIMIT"
 
+    # Try fast Gemini model first in multi-provider BYOK so failover to NVIDIA/Groq happens in <8s
     if gemini_keys:
         try:
             return call_gemini_keys(
-                gemini_keys, prompt_text, img_pil, deep=deep, is_byok=True, sys_prompt=sys_prompt
-            )
-        except Exception as exc:
-            last_err = str(exc)
-
-    for g_key in groq_keys:
-        try:
-            return call_openai_compat(
-                endpoint="https://api.groq.com/openai/v1/chat/completions",
-                api_key=g_key,
-                models=GROQ_VISION_MODELS if img_b64 else GROQ_TEXT_MODELS,
-                prompt_text=prompt_text,
-                img_b64=img_b64,
-                provider_tag="groq",
+                gemini_keys,
+                prompt_text,
+                img_pil,
+                deep=deep,
                 is_byok=True,
                 sys_prompt=sys_prompt,
+                prefer_fast=True,
             )
         except Exception as exc:
             last_err = str(exc)
@@ -654,6 +646,21 @@ def route_universal_byok(
                 prompt_text=prompt_text,
                 img_b64=img_b64,
                 provider_tag="nvidia",
+                is_byok=True,
+                sys_prompt=sys_prompt,
+            )
+        except Exception as exc:
+            last_err = str(exc)
+
+    for g_key in groq_keys:
+        try:
+            return call_openai_compat(
+                endpoint="https://api.groq.com/openai/v1/chat/completions",
+                api_key=g_key,
+                models=GROQ_VISION_MODELS if img_b64 else GROQ_TEXT_MODELS,
+                prompt_text=prompt_text,
+                img_b64=img_b64,
+                provider_tag="groq",
                 is_byok=True,
                 sys_prompt=sys_prompt,
             )
