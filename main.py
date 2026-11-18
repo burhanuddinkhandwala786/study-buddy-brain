@@ -101,7 +101,9 @@ Return ONLY valid JSON:
 Strict Output Rules:
 - IF ANY OPTIONS (A/B/C/D or 1/2/3/4) ARE PRESENT: You MUST set detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. A is correct R is wrong"), copy_value="", expanded_note="". NEVER output a long paragraph when options exist.
 - DIRECT_VALUE / CODE_FIX (no options present): cursor_pill = concise verified answer or fixed code line; copy_value = raw answer; expanded_note="".
-- CONCEPT_EXPLAIN (only when user explicitly asks "explain" or "why" in follow-up): cursor_pill = 1-line summary; expanded_note = 2 short bullet points."""
+- CONCEPT_EXPLAIN (only when user explicitly asks "explain" or "why" in follow-up): cursor_pill = 1-line summary; expanded_note = 2 short bullet points.
+- COMPOUND OPTIONS CHECK: Before finalizing any MCQ, check ALL options through E) for "both A and B", "both B and C", "all of the above", or "none of the above". If two individual options are valid and a combined option exists, you MUST select the combined option (e.g. "D. both b and c")."""
+
 
 V3_SOLVE_PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
 Solve step-by-step internally before outputting JSON:
@@ -116,7 +118,8 @@ Return ONLY valid JSON:
 Rules:
 - IF ANY OPTIONS (A/B/C/D or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. A is correct R is wrong"), copy_value="", expanded_note = 1-sentence reason for sidecar history.
 - DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer or fixed code line; copy_value = same raw value; expanded_note = 1-sentence verification note.
-- CONCEPT_EXPLAIN: cursor_pill = crisp 1-line takeaway; copy_value = takeaway; expanded_note = 3 concise bullet points."""
+- CONCEPT_EXPLAIN: cursor_pill = crisp 1-line takeaway; copy_value = takeaway; expanded_note = 3 concise bullet points.
+- COMPOUND OPTIONS CHECK: Before finalizing any MCQ, check ALL options through E) for "both A and B", "both B and C", "all of the above", or "none of the above". If two individual options are valid and a combined option exists, you MUST select the combined option (e.g. "D. both b and c")."""
 
 V3_REWRITE_PROMPT = """You are a sharp, natural executive writing assistant.
 Rewrite or craft a crisp, polite, professional reply for the provided text without fluff.
