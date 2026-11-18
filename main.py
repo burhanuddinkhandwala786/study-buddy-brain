@@ -18,7 +18,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="3.4.0")
+app = FastAPI(title="Cursor Companion Brain", version="3.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,13 +67,12 @@ Solve step-by-step internally before outputting JSON:
 3. Match your verified answer to the exact option letter/number and text.
 
 Return ONLY valid JSON:
-{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"UI_GUIDE"|"LONG_ANSWER"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","pointer_xy":null}
+{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"","pointer_xy":null}
 
-Rules:
-- MCQ: cursor_pill = exact option letter/number + text (e.g. "B. Sports"). copy_value="", expanded_note="".
-- DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer/fixed line; copy_value = same raw value; expanded_note="".
-- LONG_ANSWER: cursor_pill = short title; copy_value & expanded_note = complete structured breakdown.
-- CONCEPT_EXPLAIN: cursor_pill = 1-line summary; expanded_note = 3 high-yield bullet points."""
+Strict Output Rules:
+- IF ANY OPTIONS (A/B/C/D or 1/2/3/4) ARE PRESENT: You MUST set detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. A is correct R is wrong"), copy_value="", expanded_note="". NEVER output a long paragraph or explanation when options exist.
+- DIRECT_VALUE / CODE_FIX (no options present): cursor_pill = concise verified answer or fixed code line; copy_value = raw answer; expanded_note="".
+- CONCEPT_EXPLAIN (only when user explicitly asks "explain" or "why" in follow-up): cursor_pill = 1-line summary; expanded_note = 2 short bullet points."""
 
 
 def get_keys(env_name: str):
@@ -121,7 +120,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v3.4-multi-byok",
+        "engine": "v3.5-mcq-lock",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "cached_items": len(IMAGE_CACHE),
@@ -208,7 +207,6 @@ def self_test():
     except Exception as exc:
         results["gemini_pipeline"] = {"status": "FAIL", "error": str(exc)[:140]}
 
-    # Verify multi-key BYOK isolation guard (ensures comma-separated invalid keys never leak into shared pool)
     byok_guard = analyze_context(
         AnalyzeRequest(
             text_content="What is 2+2?",
@@ -242,6 +240,11 @@ def extract_json(raw_text: str) -> dict:
     data.setdefault("copy_value", "")
     data.setdefault("expanded_note", "")
     data.setdefault("pointer_xy", None)
+
+    # Enforce compact V1 output: strip expanded_note on MCQs and direct answers
+    if data.get("detected_type") in ("MCQ", "DIRECT_VALUE", "CODE_FIX"):
+        data["expanded_note"] = ""
+
     return data
 
 
@@ -266,7 +269,7 @@ def _try_one(api_key: str, model_name: str, prompt_text: str, img_pil, use_think
     cfg_kwargs = {
         "response_mime_type": "application/json",
         "temperature": 0.0,
-        "max_output_tokens": 1100,
+        "max_output_tokens": 900 if use_thinking else 420,
     }
     if use_thinking:
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
@@ -410,7 +413,7 @@ def call_groq(prompt_text: str, img_b64: Optional[str] = None) -> str:
                         "model": model_id,
                         "messages": messages,
                         "temperature": 0.0,
-                        "max_tokens": 700,
+                        "max_tokens": 450,
                     },
                     headers={
                         "Authorization": f"Bearer {groq_key}",
@@ -451,7 +454,8 @@ def analyze_context(req: AnalyzeRequest):
             raw_key = hashlib.md5(clean_b64.encode()).hexdigest()
 
             img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-            img_pil.thumbnail((900, 900), Image.LANCZOS)
+            # 720px max dimension cuts vision token cost by ~55% while preserving full OCR sharpness
+            img_pil.thumbnail((720, 720), Image.LANCZOS)
 
             small_img = img_pil.copy()
             small_img.thumbnail((480, 480), Image.BILINEAR)
