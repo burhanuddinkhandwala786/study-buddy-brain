@@ -18,7 +18,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="4.0.0")
+app = FastAPI(title="Cursor Companion Brain", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,6 +63,16 @@ GROQ_TEXT_MODELS = [
 GROQ_VISION_MODELS = [
     "qwen/qwen3.8-27b",
     "qwen/qwen3.6-27b",
+]
+
+NVIDIA_TEXT_MODELS = [
+    "meta/llama-3.3-70b-instruct",
+    "qwen/qwen2.5-72b-instruct",
+]
+
+NVIDIA_VISION_MODELS = [
+    "meta/llama-3.2-90b-vision-instruct",
+    "nvidia/nemotron-nano-12b-v2-vl",
 ]
 
 OPENROUTER_TEXT_MODELS = [
@@ -145,6 +155,8 @@ def detect_key_provider(api_key: str) -> str:
         return "gemini"
     if api_key.startswith("gsk_"):
         return "groq"
+    if api_key.startswith("nvapi-"):
+        return "nvidia"
     if api_key.startswith("sk-or-"):
         return "openrouter"
     if api_key.startswith("sk-"):
@@ -190,9 +202,10 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v4.0-smart-router",
+        "engine": "v4.1-quad-provider",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
+        "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
         "openrouter_keys": len(get_keys("OPENROUTER_API_KEY")),
         "cached_items": len(IMAGE_CACHE) + len(QUIZ_CACHE),
         "active_cooldowns": sum(1 for exp in KEY_COOLDOWN.values() if exp > now),
@@ -201,7 +214,12 @@ def health():
 
 @app.get("/diag")
 def diagnose_keys():
-    report = {"gemini": [], "groq": "not_configured", "openrouter": "not_configured"}
+    report = {
+        "gemini": [],
+        "groq": "not_configured",
+        "nvidia": "not_configured",
+        "openrouter": "not_configured",
+    }
 
     for index, api_key in enumerate(get_keys("GEMINI_API_KEY"), 1):
         try:
@@ -246,9 +264,51 @@ def diagnose_keys():
         except Exception as exc:
             report["groq"] = f"ERROR: {str(exc)[:120]}"
 
+    nv_keys = get_keys("NVIDIA_API_KEY")
+    if nv_keys:
+        try:
+            response = _HTTP_CLIENT.post(
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                json={
+                    "model": NVIDIA_TEXT_MODELS[0],
+                    "messages": [{"role": "user", "content": "Reply OK"}],
+                    "max_tokens": 10,
+                },
+                headers={
+                    "Authorization": f"Bearer {nv_keys[0]}",
+                    "Content-Type": "application/json",
+                },
+            )
+            report["nvidia"] = (
+                "HEALTHY"
+                if response.status_code == 200
+                else f"HTTP {response.status_code}: {response.text[:120]}"
+            )
+        except Exception as exc:
+            report["nvidia"] = f"ERROR: {str(exc)[:120]}"
+
     or_keys = get_keys("OPENROUTER_API_KEY")
     if or_keys:
-        report["openrouter"] = f"CONFIGURED ({len(or_keys)} key)"
+        try:
+            response = _HTTP_CLIENT.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json={
+                    "model": OPENROUTER_TEXT_MODELS[0],
+                    "messages": [{"role": "user", "content": "Reply OK"}],
+                    "max_tokens": 10,
+                },
+                headers={
+                    "Authorization": f"Bearer {or_keys[0]}",
+                    "Content-Type": "application/json",
+                },
+            )
+            report["openrouter"] = (
+                "HEALTHY"
+                if response.status_code == 200
+                else f"HTTP {response.status_code}: {response.text[:120]}"
+            )
+        except Exception as exc:
+            report["openrouter"] = f"ERROR: {str(exc)[:120]}"
 
     return report
 
@@ -285,7 +345,7 @@ def self_test():
     byok_guard = analyze_context(
         AnalyzeRequest(
             text_content="What is 2+2?",
-            user_api_key="AIzaInvalidTestKey1, gsk_InvalidTestKey2, sk-or-InvalidTestKey3",
+            user_api_key="AIzaInvalidTestKey1, gsk_InvalidTestKey2, nvapi-InvalidTestKey3, sk-or-InvalidTestKey4",
         )
     )
     results["universal_byok_guard"] = {
@@ -303,7 +363,6 @@ def v3_self_test():
     results = {}
     start_time = time.time()
 
-    # 1. Test V3 rewrite mode
     rewrite_res = v3_analyze_context(
         V3AnalyzeRequest(
             text_content="send me the notes fast bro",
@@ -315,7 +374,6 @@ def v3_self_test():
         "pill": rewrite_res.get("cursor_pill"),
     }
 
-    # 2. Test V3 3-minute quiz deduplication cache
     sample_q = "What is the characteristic impedance of free space in ohms?"
     QUIZ_CACHE[normalize_quiz_hash(sample_q)] = (
         time.time(),
@@ -556,10 +614,11 @@ def route_universal_byok(
 ) -> str:
     gemini_keys = [k for k in user_keys if detect_key_provider(k) == "gemini"]
     groq_keys = [k for k in user_keys if detect_key_provider(k) == "groq"]
+    nvidia_keys = [k for k in user_keys if detect_key_provider(k) == "nvidia"]
     openrouter_keys = [k for k in user_keys if detect_key_provider(k) == "openrouter"]
     openai_keys = [k for k in user_keys if detect_key_provider(k) == "openai"]
 
-    if not (gemini_keys or groq_keys or openrouter_keys or openai_keys):
+    if not (gemini_keys or groq_keys or nvidia_keys or openrouter_keys or openai_keys):
         raise RuntimeError("BYOK_INVALID")
 
     last_err = "BYOK_LIMIT"
@@ -581,6 +640,21 @@ def route_universal_byok(
                 prompt_text=prompt_text,
                 img_b64=img_b64,
                 provider_tag="groq",
+                is_byok=True,
+                sys_prompt=sys_prompt,
+            )
+        except Exception as exc:
+            last_err = str(exc)
+
+    for nv_key in nvidia_keys:
+        try:
+            return call_openai_compat(
+                endpoint="https://integrate.api.nvidia.com/v1/chat/completions",
+                api_key=nv_key,
+                models=NVIDIA_VISION_MODELS if img_b64 else NVIDIA_TEXT_MODELS,
+                prompt_text=prompt_text,
+                img_b64=img_b64,
+                provider_tag="nvidia",
                 is_byok=True,
                 sys_prompt=sys_prompt,
             )
@@ -618,6 +692,30 @@ def route_universal_byok(
             last_err = str(exc)
 
     raise RuntimeError(last_err)
+
+
+def _call_nvidia_pool(
+    prompt_text: str,
+    img_b64: Optional[str] = None,
+    sys_prompt: str = PROMPT,
+) -> Optional[str]:
+    for nv_key in get_keys("NVIDIA_API_KEY"):
+        try:
+            res = call_openai_compat(
+                endpoint="https://integrate.api.nvidia.com/v1/chat/completions",
+                api_key=nv_key,
+                models=NVIDIA_VISION_MODELS if img_b64 else NVIDIA_TEXT_MODELS,
+                prompt_text=prompt_text,
+                img_b64=img_b64,
+                provider_tag="nvidia",
+                is_byok=False,
+                sys_prompt=sys_prompt,
+            )
+            if res:
+                return res
+        except Exception:
+            continue
+    return None
 
 
 def _call_openrouter_pool(
@@ -712,7 +810,7 @@ def analyze_context(req: AnalyzeRequest):
                 if "BYOK_INVALID" in err_msg:
                     return {
                         "detected_type": "ERROR",
-                        "cursor_pill": "Invalid key (use AIza / gsk_ / sk-)",
+                        "cursor_pill": "Invalid key (AIza / gsk_ / nvapi / sk-)",
                         "copy_value": "",
                         "expanded_note": "",
                         "pointer_xy": None,
@@ -780,7 +878,7 @@ def analyze_context(req: AnalyzeRequest):
 
 
 # ==============================================================================
-# V3 SMART ANTI-CLASH ROUTE (SPLIT TEXT/VISION QUOTA + 3-MIN QUIZ DEDUP + MODES)
+# V3 QUAD-PROVIDER ANTI-CLASH ROUTE (GEMINI + GROQ + NVIDIA + OPENROUTER)
 # ==============================================================================
 @app.post("/v3/analyze")
 def v3_analyze_context(req: V3AnalyzeRequest):
@@ -876,7 +974,7 @@ def v3_analyze_context(req: V3AnalyzeRequest):
                 if "BYOK_INVALID" in err_msg:
                     return {
                         "detected_type": "ERROR",
-                        "cursor_pill": "Invalid key (use AIza / gsk_ / sk-)",
+                        "cursor_pill": "Invalid key (AIza / gsk_ / nvapi / sk-)",
                         "copy_value": "",
                         "expanded_note": "",
                         "pointer_xy": None,
@@ -891,8 +989,7 @@ def v3_analyze_context(req: V3AnalyzeRequest):
                     "key_source": "BYOK",
                 }
         elif is_text_only:
-            # TEXT QUOTA SHIELD: Route text/follow-ups to high-RPM Groq & Flash-Lite first,
-            # saving Gemini 3.8 Flash vision quota strictly for screenshot scans!
+            # TEXT QUOTA SHIELD: Groq -> NVIDIA NIM -> Gemini Flash-Lite -> OpenRouter Free
             for g_key in get_keys("GROQ_API_KEY"):
                 try:
                     raw_json = call_openai_compat(
@@ -910,6 +1007,9 @@ def v3_analyze_context(req: V3AnalyzeRequest):
                     errors.append(f"Groq: {exc}")
 
             if not raw_json:
+                raw_json = _call_nvidia_pool(contents_text, sys_prompt=sys_prompt)
+
+            if not raw_json:
                 try:
                     raw_json = call_gemini_keys(
                         keys=get_keys("GEMINI_API_KEY"),
@@ -925,7 +1025,7 @@ def v3_analyze_context(req: V3AnalyzeRequest):
             if not raw_json:
                 raw_json = _call_openrouter_pool(contents_text, sys_prompt=sys_prompt)
         else:
-            # VISION QUOTA SHIELD: Route image scans to high-accuracy Gemini Vision -> Groq Vision -> OpenRouter Free Vision
+            # VISION QUOTA SHIELD: Gemini Vision -> Groq Vision -> NVIDIA Vision -> OpenRouter Free Vision
             try:
                 raw_json = call_gemini_keys(
                     keys=get_keys("GEMINI_API_KEY"),
@@ -956,6 +1056,11 @@ def v3_analyze_context(req: V3AnalyzeRequest):
                             break
                     except Exception as exc:
                         errors.append(f"Groq: {exc}")
+
+            if not raw_json:
+                raw_json = _call_nvidia_pool(
+                    contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt
+                )
 
             if not raw_json:
                 raw_json = _call_openrouter_pool(
