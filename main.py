@@ -57,8 +57,11 @@ GEMINI_VISION_MODELS = [
 ]
 
 GROQ_TEXT_MODELS = [
-    "llama-3.3-70b-specdec",
-    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",  # Flagship large text & reasoning model
+    "openai/gpt-oss-20b",  # High-speed text & reasoning model (1,000 tps)
+    "qwen/qwen3.8-27b",  # Strong general-purpose & multilingual model
+    "llama-3.3-70b-versatile",  # Active replacement for llama-3.3-70b-specdec
+    "llama-3.1-8b-instant",  # Ultra-fast lightweight model (still active)
 ]
 
 GROQ_VISION_MODELS = [
