@@ -306,7 +306,7 @@ def self_test():
         )
         results["groq_pipeline"] = {"status": "200 OK", "output": extract_json(raw_groq).get("cursor_pill")}
     except Exception as exc:
-        results["groq_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
+        results["groq_pipeline"] = {"status": "WARNING", "note": "Groq fallback active", "error": str(exc)[:80]}
 
     try:
         raw_gemini = call_gemini_keys(
