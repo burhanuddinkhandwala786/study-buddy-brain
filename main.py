@@ -19,7 +19,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="4.5.0")
+app = FastAPI(title="Cursor Companion Brain", version="4.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_HTTP_CLIENT = httpx.Client(timeout=8.5)
+_HTTP_CLIENT = httpx.Client(timeout=12.0)
 
 IMAGE_CACHE = {}
 CACHE_TTL = 900
@@ -42,7 +42,7 @@ _KEY_CYCLE = itertools.count()
 _GEMINI_CLIENTS = {}
 _GEMINI_CLIENTS_LOCK = threading.Lock()
 _DB_LOCK = threading.Lock()
-_DB_PATH = "/tmp/companion_brain_cache_v3.db"
+_DB_PATH = "/tmp/companion_brain_cache_v4.db"
 
 GEMINI_FAST_MODELS = [
     "gemini-3.5-flash-lite",
@@ -56,9 +56,7 @@ GEMINI_VISION_MODELS = [
     "gemini-3.5-flash",
 ]
 
-# Non-reasoning fast models FIRST so zero "The user wants to..." monologue ever leaks
 GROQ_TEXT_MODELS = [
-    "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "openai/gpt-oss-120b",
 ]
@@ -85,7 +83,7 @@ OPENROUTER_TEXT_MODELS = [
 
 OPENROUTER_VISION_MODELS = [
     "openrouter/free",
-    "nvidia/nemotron-3.5-super-vl:free",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
 ]
 
 PROMPT = """You are an elite academic and competitive-exam answer engine.
@@ -204,7 +202,7 @@ def normalize_quiz_hash(text: str) -> str:
     )
     words = re.findall(r"[a-z0-9]+", s.lower())
     cleaned = "".join(words)
-    return hashlib.md5(f"v3:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
+    return hashlib.md5(f"v4:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -226,7 +224,8 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                client = genai.Client(api_key=api_key, http_options={"timeout": 9000})
+                # Removed http_options timeout to satisfy GenAI SDK minimum deadline requirements
+                client = genai.Client(api_key=api_key)
                 _GEMINI_CLIENTS[api_key] = client
     return client
 
@@ -237,7 +236,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v4.5-fast-clean-json",
+        "engine": "v4.6-fast-clean-json",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
@@ -352,7 +351,6 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
 
     data = None
 
-    # 1. Direct JSON parse
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, list) and parsed:
@@ -362,7 +360,6 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
     except Exception:
         pass
 
-    # 2. Scan ALL JSON objects and pick the LAST valid one containing "cursor_pill" (avoids thinking examples)
     if data is None:
         decoder = json.JSONDecoder()
         for idx, ch in enumerate(cleaned):
@@ -374,7 +371,6 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
                 except Exception:
                     continue
 
-    # 3. Regex extraction of cursor_pill
     if data is None:
         pill_match = re.search(r'"cursor_pill"\s*:\s*"([^"]+)"', cleaned)
         if pill_match:
@@ -390,7 +386,6 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
                 "pointer_xy": None,
             }
 
-    # 4. Reject internal monologue leakage ("The user wants to...") so model fails over cleanly
     if not isinstance(data, dict):
         lines = [
             ln.strip().lstrip("*-•").strip()
@@ -444,7 +439,6 @@ def _try_one_gemini(
     img_pil,
     sys_prompt: str = PROMPT,
 ) -> str:
-    # Fast mode (no hidden thinking tokens) -> 0.5s - 1.1s latency
     cfg = types.GenerateContentConfig(
         response_mime_type="application/json",
         temperature=0.0,
@@ -646,7 +640,6 @@ def _run_shared_cascade(
     is_text_only = img_pil is None
 
     if is_text_only:
-        # Fast non-reasoning cascade: Groq Llama-3.3 -> Gemini Flash-Lite -> NVIDIA -> OpenRouter
         for g_key in get_keys("GROQ_API_KEY"):
             try:
                 raw_json = call_openai_compat(
@@ -791,7 +784,7 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
             "key_source": "POOL",
         }
 
-    cache_key = hashlib.md5(f"v3:{raw_key}".encode()).hexdigest()
+    cache_key = hashlib.md5(f"v4:{raw_key}".encode()).hexdigest()
     image_hit = IMAGE_CACHE.get(cache_key)
     if not is_followup and image_hit and time.time() - image_hit[0] < CACHE_TTL:
         cached = dict(image_hit[1])
