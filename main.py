@@ -46,15 +46,15 @@ _DB_PATH = "/tmp/companion_brain_cache.db"
 
 # Distinct Gemini model buckets so 3 keys = 9 independent daily/minute quota pools
 GEMINI_FAST_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
 ]
 
 GEMINI_VISION_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
 ]
 
 GROQ_TEXT_MODELS = [
@@ -278,7 +278,7 @@ def diagnose_keys():
         try:
             client = _get_client(api_key)
             response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
+                model="gemini-3.5-flash-lite",
                 contents="Reply OK",
                 config=types.GenerateContentConfig(max_output_tokens=10),
             )
