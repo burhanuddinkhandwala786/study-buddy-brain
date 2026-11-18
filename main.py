@@ -18,7 +18,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="4.1.0")
+app = FastAPI(title="Cursor Companion Brain", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,7 +27,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_HTTP_CLIENT = httpx.Client(timeout=20.0)
+# 10s timeout ensures fast multi-provider failover before client/Render proxy timeout
+_HTTP_CLIENT = httpx.Client(timeout=10.0)
 
 IMAGE_CACHE = {}
 CACHE_TTL = 600
@@ -84,6 +85,7 @@ OPENROUTER_VISION_MODELS = [
     "openrouter/free",
     "nvidia/nemotron-3.5-super-vl:free",
 ]
+
 PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
 Solve step-by-step internally before outputting JSON:
 1. If multiple questions appear in a screenshot, focus ONLY on the primary/centered question.
@@ -189,7 +191,7 @@ def _get_client(api_key: str):
             if client is None:
                 client = genai.Client(
                     api_key=api_key,
-                    http_options={"timeout": 19000},
+                    http_options={"timeout": 12000},
                 )
                 _GEMINI_CLIENTS[api_key] = client
     return client
@@ -201,7 +203,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v4.1-quad-provider",
+        "engine": "v4.3-resilient-json",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
@@ -396,16 +398,72 @@ def v3_self_test():
 
 
 def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
-    cleaned = re.sub(r"```(?:json)?|```", "", raw_text or "", flags=re.I).strip()
-    match = re.search(r"\{.*\}", cleaned, re.S)
-    if not match:
-        raise ValueError("No JSON object found in model response")
+    # 1. Strip <think>...</think> reasoning blocks emitted by Qwen / GPT-OSS / Nemotron
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.S | re.I)
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.S | re.I)
+    cleaned = re.sub(r"```(?:json)?|```", "", cleaned, flags=re.I).strip()
 
-    data = json.loads(match.group(0))
-    if isinstance(data, list) and data:
-        data = data[0]
+    if not cleaned:
+        raise ValueError("Empty model output")
+
+    data = None
+
+    # 2. Try direct JSON parse first
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list) and parsed:
+            parsed = parsed[0]
+        if isinstance(parsed, dict):
+            data = parsed
+    except Exception:
+        pass
+
+    # 3. Balanced brace scanner for JSON object containing "cursor_pill"
+    if data is None:
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(cleaned):
+            if ch == "{":
+                try:
+                    obj, _ = decoder.raw_decode(cleaned[idx:])
+                    if isinstance(obj, dict) and ("cursor_pill" in obj or "detected_type" in obj):
+                        data = obj
+                        break
+                except Exception:
+                    continue
+
+    # 4. Regex fallback for single-line cursor_pill extraction if JSON quotes were unescaped
+    if data is None:
+        pill_match = re.search(r'"cursor_pill"\s*:\s*"([^"]+)"', cleaned)
+        if pill_match:
+            pill_val = pill_match.group(1).strip()
+            copy_match = re.search(r'"copy_value"\s*:\s*"([^"]*)"', cleaned)
+            note_match = re.search(r'"expanded_note"\s*:\s*"([^"]*)"', cleaned)
+            type_match = re.search(r'"detected_type"\s*:\s*"([^"]+)"', cleaned)
+            data = {
+                "detected_type": type_match.group(1) if type_match else "DIRECT_VALUE",
+                "cursor_pill": pill_val,
+                "copy_value": copy_match.group(1) if copy_match else pill_val,
+                "expanded_note": note_match.group(1) if note_match else "",
+                "pointer_xy": None,
+            }
+
+    # 5. Last-resort plain-text fallback so valid answers never crash into "High traffic"
     if not isinstance(data, dict):
-        raise ValueError("Model response was not a JSON object")
+        lines = [
+            ln.strip().lstrip("*-•").strip()
+            for ln in cleaned.splitlines()
+            if ln.strip() and not ln.strip().startswith("{") and not ln.strip().startswith("}")
+        ]
+        if not lines:
+            raise ValueError("Could not parse response")
+        first_line = lines[0][:85]
+        data = {
+            "detected_type": "DIRECT_VALUE",
+            "cursor_pill": first_line,
+            "copy_value": first_line,
+            "expanded_note": " ".join(lines[:3])[:260] if preserve_notes else "",
+            "pointer_xy": None,
+        }
 
     data.setdefault("detected_type", "DIRECT_VALUE")
     data.setdefault("cursor_pill", "Done")
@@ -446,7 +504,7 @@ def _try_one_gemini(
     cfg_kwargs = {
         "response_mime_type": "application/json",
         "temperature": 0.0,
-        "max_output_tokens": 950 if use_thinking else 550,
+        "max_output_tokens": 900 if use_thinking else 550,
     }
     if use_thinking:
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
@@ -461,6 +519,8 @@ def _try_one_gemini(
             config=types.GenerateContentConfig(**cfg_kwargs),
         )
         if response and response.text:
+            # Verify valid JSON before returning
+            extract_json(response.text, preserve_notes=True)
             return response.text
         raise RuntimeError("empty response")
     except Exception as exc:
@@ -473,6 +533,7 @@ def _try_one_gemini(
                 config=types.GenerateContentConfig(**cfg_kwargs),
             )
             if retry_response and retry_response.text:
+                extract_json(retry_response.text, preserve_notes=True)
                 return retry_response.text
         raise
 
@@ -569,15 +630,19 @@ def call_openai_compat(
             headers["HTTP-Referer"] = "https://study-buddy-brain.onrender.com"
             headers["X-Title"] = "Cursor Companion"
 
+        payload_body = {
+            "model": model_id,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 650,
+        }
+        if provider_tag == "groq" and not img_b64:
+            payload_body["response_format"] = {"type": "json_object"}
+
         try:
             response = _HTTP_CLIENT.post(
                 endpoint,
-                json={
-                    "model": model_id,
-                    "messages": messages,
-                    "temperature": 0.0,
-                    "max_tokens": 550,
-                },
+                json=payload_body,
                 headers=headers,
             )
         except Exception as exc:
@@ -585,7 +650,28 @@ def call_openai_compat(
             continue
 
         if response.status_code == 200:
-            return response.json()["choices"][0]["message"]["content"]
+            try:
+                content = response.json()["choices"][0]["message"]["content"]
+                if content:
+                    # Validate that content parses cleanly before returning
+                    extract_json(content, preserve_notes=True)
+                    return content
+            except Exception as parse_exc:
+                last_error = f"{provider_tag} {model_id} parse error: {str(parse_exc)[:80]}"
+                continue
+
+        # If Groq rejected response_format on a specific model, retry once without response_format
+        if response.status_code == 400 and "response_format" in payload_body:
+            payload_body.pop("response_format", None)
+            try:
+                retry_res = _HTTP_CLIENT.post(endpoint, json=payload_body, headers=headers)
+                if retry_res.status_code == 200:
+                    content = retry_res.json()["choices"][0]["message"]["content"]
+                    if content:
+                        extract_json(content, preserve_notes=True)
+                        return content
+            except Exception:
+                pass
 
         last_error = f"{provider_tag} {model_id}: HTTP {response.status_code}"
         if response.status_code in (401, 403):
@@ -595,7 +681,7 @@ def call_openai_compat(
             break
         if response.status_code == 429:
             KEY_COOLDOWN[cooldown_key] = time.time() + 35
-        elif response.status_code in (400, 404):
+        elif response.status_code in (400, 404, 410):
             KEY_COOLDOWN[cooldown_key] = time.time() + 86400
 
     if is_byok:
@@ -620,9 +706,8 @@ def route_universal_byok(
     if not (gemini_keys or groq_keys or nvidia_keys or openrouter_keys or openai_keys):
         raise RuntimeError("BYOK_INVALID")
 
-    last_err = "BYOK_LIMIT"
+    errors = []
 
-    # Try fast Gemini model first in multi-provider BYOK so failover to NVIDIA/Groq happens in <8s
     if gemini_keys:
         try:
             return call_gemini_keys(
@@ -635,7 +720,7 @@ def route_universal_byok(
                 prefer_fast=True,
             )
         except Exception as exc:
-            last_err = str(exc)
+            errors.append(str(exc))
 
     for nv_key in nvidia_keys:
         try:
@@ -650,7 +735,7 @@ def route_universal_byok(
                 sys_prompt=sys_prompt,
             )
         except Exception as exc:
-            last_err = str(exc)
+            errors.append(str(exc))
 
     for g_key in groq_keys:
         try:
@@ -665,7 +750,7 @@ def route_universal_byok(
                 sys_prompt=sys_prompt,
             )
         except Exception as exc:
-            last_err = str(exc)
+            errors.append(str(exc))
 
     for or_key in openrouter_keys:
         try:
@@ -680,7 +765,7 @@ def route_universal_byok(
                 sys_prompt=sys_prompt,
             )
         except Exception as exc:
-            last_err = str(exc)
+            errors.append(str(exc))
 
     for oa_key in openai_keys:
         try:
@@ -695,9 +780,11 @@ def route_universal_byok(
                 sys_prompt=sys_prompt,
             )
         except Exception as exc:
-            last_err = str(exc)
+            errors.append(str(exc))
 
-    raise RuntimeError(last_err)
+    if errors and all("BYOK_INVALID" in e for e in errors):
+        raise RuntimeError("BYOK_INVALID")
+    raise RuntimeError(" | ".join(errors) if errors else "BYOK_LIMIT")
 
 
 def _call_nvidia_pool(
@@ -859,6 +946,12 @@ def analyze_context(req: AnalyzeRequest):
                     except Exception as exc:
                         errors.append(f"Groq: {exc}")
 
+            if not raw_json:
+                raw_json = _call_nvidia_pool(contents_text, img_b64=img_b64_str)
+
+            if not raw_json:
+                raw_json = _call_openrouter_pool(contents_text, img_b64=img_b64_str)
+
         if not raw_json:
             raise RuntimeError(" | ".join(errors))
 
@@ -990,12 +1083,12 @@ def v3_analyze_context(req: V3AnalyzeRequest):
                     "detected_type": "ERROR",
                     "cursor_pill": "Personal key busy — retry",
                     "copy_value": "",
-                    "expanded_note": "",
+                    "expanded_note": err_msg[:260],
                     "pointer_xy": None,
                     "key_source": "BYOK",
                 }
         elif is_text_only:
-            # TEXT QUOTA SHIELD: Groq -> NVIDIA NIM -> Gemini Flash-Lite -> OpenRouter Free
+            # TEXT QUOTA SHIELD: Groq -> Gemini Flash-Lite -> NVIDIA NIM -> OpenRouter Free
             for g_key in get_keys("GROQ_API_KEY"):
                 try:
                     raw_json = call_openai_compat(
@@ -1013,9 +1106,6 @@ def v3_analyze_context(req: V3AnalyzeRequest):
                     errors.append(f"Groq: {exc}")
 
             if not raw_json:
-                raw_json = _call_nvidia_pool(contents_text, sys_prompt=sys_prompt)
-
-            if not raw_json:
                 try:
                     raw_json = call_gemini_keys(
                         keys=get_keys("GEMINI_API_KEY"),
@@ -1027,6 +1117,9 @@ def v3_analyze_context(req: V3AnalyzeRequest):
                     )
                 except Exception as exc:
                     errors.append(f"Gemini: {exc}")
+
+            if not raw_json:
+                raw_json = _call_nvidia_pool(contents_text, sys_prompt=sys_prompt)
 
             if not raw_json:
                 raw_json = _call_openrouter_pool(contents_text, sys_prompt=sys_prompt)
@@ -1097,7 +1190,7 @@ def v3_analyze_context(req: V3AnalyzeRequest):
             "detected_type": "ERROR",
             "cursor_pill": "High traffic — press hotkey again",
             "copy_value": "",
-            "expanded_note": "",
+            "expanded_note": str(exc)[:260],
             "pointer_xy": None,
             "key_source": "POOL",
         }
