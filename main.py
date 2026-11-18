@@ -57,8 +57,8 @@ GEMINI_VISION_MODELS = [
 ]
 
 GROQ_TEXT_MODELS = [
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-120b",
+    "llama-3.1-70b-versatile",
+    "mixtral-8x7b-32768",
 ]
 
 GROQ_VISION_MODELS = [
