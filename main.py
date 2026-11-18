@@ -216,10 +216,10 @@ def detect_key_provider(api_key: str) -> str:
 
 
 def normalize_quiz_hash(text: str) -> str:
-    # Strip leading question numbers (e.g., "Q12.", "12)", "[2 Marks]") so identical questions match across users
     s = re.sub(r"^\s*(?:q(?:uestion)?\s*\d+[\.\)\:\-]*|\d+[\.\)\:\-]+|\[\d+\s*marks?\])\s*", "", (text or "").strip(), flags=re.I)
-    cleaned = re.sub(r"[^a-z0-9]+", "", s.lower())
-    return hashlib.md5(cleaned.encode()).hexdigest() if len(cleaned) >= 22 else ""
+    words = re.findall(r"[a-z0-9]+", s.lower())
+    cleaned = "".join(words)
+    return hashlib.md5(cleaned.encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
 
 
 class AnalyzeRequest(BaseModel):
