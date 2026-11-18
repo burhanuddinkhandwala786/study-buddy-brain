@@ -18,7 +18,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="3.6.0")
+app = FastAPI(title="Cursor Companion Brain", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +31,11 @@ _HTTP_CLIENT = httpx.Client(timeout=20.0)
 
 IMAGE_CACHE = {}
 CACHE_TTL = 600
+
+# V3 3-minute verified quiz deduplication (prevents college-lab RPM/RPD bursts on identical questions)
+QUIZ_CACHE = {}
+QUIZ_CACHE_TTL = 180
+
 KEY_COOLDOWN = {}
 _KEY_CYCLE = itertools.count()
 
@@ -85,6 +90,39 @@ Strict Output Rules:
 - DIRECT_VALUE / CODE_FIX (no options present): cursor_pill = concise verified answer or fixed code line; copy_value = raw answer; expanded_note="".
 - CONCEPT_EXPLAIN (only when user explicitly asks "explain" or "why" in follow-up): cursor_pill = 1-line summary; expanded_note = 2 short bullet points."""
 
+V3_SOLVE_PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
+Solve step-by-step internally before outputting JSON:
+1. If multiple questions appear in a screenshot, focus ONLY on the primary/centered question.
+2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
+3. Independently calculate or verify the exact factual answer BEFORE looking at any pre-selected radio buttons or highlights.
+4. Match your verified answer to the exact option letter/number and text.
+
+Return ONLY valid JSON:
+{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high"|"medium","pointer_xy":null}
+
+Rules:
+- IF ANY OPTIONS (A/B/C/D or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. A is correct R is wrong"), copy_value="", expanded_note = 1-sentence reason for sidecar history.
+- DIRECT_VALUE / CODE_FIX: cursor_pill = exact verified answer or fixed code line; copy_value = same raw value; expanded_note = 1-sentence verification note.
+- CONCEPT_EXPLAIN: cursor_pill = crisp 1-line takeaway; copy_value = takeaway; expanded_note = 3 concise bullet points."""
+
+V3_REWRITE_PROMPT = """You are a sharp, natural executive writing assistant.
+Rewrite or craft a crisp, polite, professional reply for the provided text without fluff.
+Return ONLY valid JSON:
+{"detected_type":"REWRITE","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
+Rules:
+- cursor_pill = concise 1-line preview of the polished rewrite (max 70 chars).
+- copy_value = complete ready-to-paste polished text.
+- expanded_note = brief note on tone improvement."""
+
+V3_EXPLAIN_PROMPT = """You are an expert technical and academic tutor.
+Explain the provided concept, code snippet, or error clearly in plain English.
+Return ONLY valid JSON:
+{"detected_type":"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
+Rules:
+- cursor_pill = single crisp 1-line summary (max 75 chars).
+- copy_value = same 1-line summary.
+- expanded_note = 3 high-yield bullet points for the study sidecar."""
+
 
 def get_keys(env_name: str):
     return [
@@ -114,12 +152,22 @@ def detect_key_provider(api_key: str) -> str:
     return "unknown"
 
 
+def normalize_quiz_hash(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+    return hashlib.md5(cleaned.encode()).hexdigest() if len(cleaned) >= 25 else ""
+
+
 class AnalyzeRequest(BaseModel):
     image_base64: Optional[str] = None
     text_content: Optional[str] = None
     follow_up: Optional[str] = None
     prior_context: Optional[str] = None
     user_api_key: Optional[str] = None
+
+
+class V3AnalyzeRequest(AnalyzeRequest):
+    action_mode: Optional[str] = "solve"  # "solve" | "rewrite" | "explain"
+    device_id: Optional[str] = None
 
 
 def _get_client(api_key: str):
@@ -142,17 +190,18 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v3.6-universal-byok",
+        "engine": "v4.0-smart-router",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
-        "cached_items": len(IMAGE_CACHE),
+        "openrouter_keys": len(get_keys("OPENROUTER_API_KEY")),
+        "cached_items": len(IMAGE_CACHE) + len(QUIZ_CACHE),
         "active_cooldowns": sum(1 for exp in KEY_COOLDOWN.values() if exp > now),
     }
 
 
 @app.get("/diag")
 def diagnose_keys():
-    report = {"gemini": [], "groq": "not_configured"}
+    report = {"gemini": [], "groq": "not_configured", "openrouter": "not_configured"}
 
     for index, api_key in enumerate(get_keys("GEMINI_API_KEY"), 1):
         try:
@@ -196,6 +245,10 @@ def diagnose_keys():
             )
         except Exception as exc:
             report["groq"] = f"ERROR: {str(exc)[:120]}"
+
+    or_keys = get_keys("OPENROUTER_API_KEY")
+    if or_keys:
+        report["openrouter"] = f"CONFIGURED ({len(or_keys)} key)"
 
     return report
 
@@ -245,7 +298,47 @@ def self_test():
     return results
 
 
-def extract_json(raw_text: str) -> dict:
+@app.get("/v3/selftest")
+def v3_self_test():
+    results = {}
+    start_time = time.time()
+
+    # 1. Test V3 rewrite mode
+    rewrite_res = v3_analyze_context(
+        V3AnalyzeRequest(
+            text_content="send me the notes fast bro",
+            action_mode="rewrite",
+        )
+    )
+    results["v3_rewrite_mode"] = {
+        "status": "200 OK" if rewrite_res.get("detected_type") != "ERROR" else "FAIL",
+        "pill": rewrite_res.get("cursor_pill"),
+    }
+
+    # 2. Test V3 3-minute quiz deduplication cache
+    sample_q = "What is the characteristic impedance of free space in ohms?"
+    QUIZ_CACHE[normalize_quiz_hash(sample_q)] = (
+        time.time(),
+        {
+            "detected_type": "DIRECT_VALUE",
+            "cursor_pill": "377 ohms",
+            "copy_value": "377",
+            "expanded_note": "Z0 = sqrt(mu0 / eps0) ≈ 376.73 ohms.",
+            "pointer_xy": None,
+            "key_source": "CACHE",
+        },
+    )
+    cached_res = v3_analyze_context(V3AnalyzeRequest(text_content=sample_q, action_mode="solve"))
+    results["v3_quiz_dedup_cache"] = {
+        "status": "200 OK (0-token hit)" if cached_res.get("cursor_pill") == "377 ohms" else "FAIL",
+        "key_source": cached_res.get("key_source"),
+    }
+
+    results["elapsed_ms"] = round((time.time() - start_time) * 1000)
+    return results
+
+
+def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
     cleaned = re.sub(r"```(?:json)?|```", "", raw_text or "", flags=re.I).strip()
     match = re.search(r"\{.*\}", cleaned, re.S)
     if not match:
@@ -263,7 +356,7 @@ def extract_json(raw_text: str) -> dict:
     data.setdefault("expanded_note", "")
     data.setdefault("pointer_xy", None)
 
-    if data.get("detected_type") in ("MCQ", "DIRECT_VALUE", "CODE_FIX"):
+    if not preserve_notes and data.get("detected_type") in ("MCQ", "DIRECT_VALUE", "CODE_FIX"):
         data["expanded_note"] = ""
 
     return data
@@ -285,7 +378,14 @@ def _classify_gemini_error(error_text: str) -> str:
     return "other"
 
 
-def _try_one_gemini(api_key: str, model_name: str, prompt_text: str, img_pil, use_thinking: bool) -> str:
+def _try_one_gemini(
+    api_key: str,
+    model_name: str,
+    prompt_text: str,
+    img_pil,
+    use_thinking: bool,
+    sys_prompt: str = PROMPT,
+) -> str:
     cfg_kwargs = {
         "response_mime_type": "application/json",
         "temperature": 0.0,
@@ -295,7 +395,7 @@ def _try_one_gemini(api_key: str, model_name: str, prompt_text: str, img_pil, us
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
 
     client = _get_client(api_key)
-    contents = [PROMPT, prompt_text] + ([img_pil] if img_pil is not None else [])
+    contents = [sys_prompt, prompt_text] + ([img_pil] if img_pil is not None else [])
 
     try:
         response = client.models.generate_content(
@@ -326,6 +426,8 @@ def call_gemini_keys(
     img_pil: Optional[Image.Image] = None,
     deep: bool = False,
     is_byok: bool = False,
+    sys_prompt: str = PROMPT,
+    prefer_fast: bool = False,
 ) -> str:
     if not keys:
         raise RuntimeError("No Gemini keys configured")
@@ -333,12 +435,14 @@ def call_gemini_keys(
     now = time.time()
     start_idx = next(_KEY_CYCLE) % len(keys)
     ordered_keys = keys[start_idx:] + keys[:start_idx]
-    # Use higher-reasoning vision models when solving images or follow-ups for maximum accuracy
-    models = GEMINI_VISION_MODELS if (deep or img_pil is not None) else GEMINI_FAST_MODELS
+    if prefer_fast:
+        models = GEMINI_FAST_MODELS
+    else:
+        models = GEMINI_VISION_MODELS if (deep or img_pil is not None) else GEMINI_FAST_MODELS
     last_error = "Gemini keys cooling down"
 
     for model_name in models:
-        use_thinking = (deep or img_pil is not None) and "lite" not in model_name
+        use_thinking = (not prefer_fast) and (deep or img_pil is not None) and "lite" not in model_name
         for api_key in ordered_keys:
             if KEY_COOLDOWN.get(api_key, 0) > now:
                 continue
@@ -347,7 +451,9 @@ def call_gemini_keys(
                 continue
 
             try:
-                return _try_one_gemini(api_key, model_name, prompt_text, img_pil, use_thinking)
+                return _try_one_gemini(
+                    api_key, model_name, prompt_text, img_pil, use_thinking, sys_prompt=sys_prompt
+                )
             except Exception as exc:
                 error_text = str(exc)
                 last_error = f"{model_name}: {error_text[:120]}"
@@ -375,6 +481,7 @@ def call_openai_compat(
     img_b64: Optional[str] = None,
     provider_tag: str = "compat",
     is_byok: bool = False,
+    sys_prompt: str = PROMPT,
 ) -> str:
     last_error = f"No {provider_tag} attempt succeeded"
 
@@ -387,13 +494,13 @@ def call_openai_compat(
             messages = [{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": f"{PROMPT}\n\n{prompt_text}"},
+                    {"type": "text", "text": f"{sys_prompt}\n\n{prompt_text}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
                 ],
             }]
         else:
             messages = [
-                {"role": "system", "content": PROMPT},
+                {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt_text},
             ]
 
@@ -445,6 +552,7 @@ def route_universal_byok(
     img_pil: Optional[Image.Image] = None,
     img_b64: Optional[str] = None,
     deep: bool = False,
+    sys_prompt: str = PROMPT,
 ) -> str:
     gemini_keys = [k for k in user_keys if detect_key_provider(k) == "gemini"]
     groq_keys = [k for k in user_keys if detect_key_provider(k) == "groq"]
@@ -458,7 +566,9 @@ def route_universal_byok(
 
     if gemini_keys:
         try:
-            return call_gemini_keys(gemini_keys, prompt_text, img_pil, deep=deep, is_byok=True)
+            return call_gemini_keys(
+                gemini_keys, prompt_text, img_pil, deep=deep, is_byok=True, sys_prompt=sys_prompt
+            )
         except Exception as exc:
             last_err = str(exc)
 
@@ -472,6 +582,7 @@ def route_universal_byok(
                 img_b64=img_b64,
                 provider_tag="groq",
                 is_byok=True,
+                sys_prompt=sys_prompt,
             )
         except Exception as exc:
             last_err = str(exc)
@@ -486,6 +597,7 @@ def route_universal_byok(
                 img_b64=img_b64,
                 provider_tag="openrouter",
                 is_byok=True,
+                sys_prompt=sys_prompt,
             )
         except Exception as exc:
             last_err = str(exc)
@@ -500,6 +612,7 @@ def route_universal_byok(
                 img_b64=img_b64,
                 provider_tag="openai",
                 is_byok=True,
+                sys_prompt=sys_prompt,
             )
         except Exception as exc:
             last_err = str(exc)
@@ -507,6 +620,33 @@ def route_universal_byok(
     raise RuntimeError(last_err)
 
 
+def _call_openrouter_pool(
+    prompt_text: str,
+    img_b64: Optional[str] = None,
+    sys_prompt: str = PROMPT,
+) -> Optional[str]:
+    for or_key in get_keys("OPENROUTER_API_KEY"):
+        try:
+            res = call_openai_compat(
+                endpoint="https://openrouter.ai/api/v1/chat/completions",
+                api_key=or_key,
+                models=OPENROUTER_VISION_MODELS if img_b64 else OPENROUTER_TEXT_MODELS,
+                prompt_text=prompt_text,
+                img_b64=img_b64,
+                provider_tag="openrouter",
+                is_byok=False,
+                sys_prompt=sys_prompt,
+            )
+            if res:
+                return res
+        except Exception:
+            continue
+    return None
+
+
+# ==============================================================================
+# V1 / V2 LEGACY ROUTE (100% UNTOUCHED FOR ZERO BREAKAGE)
+# ==============================================================================
 @app.post("/analyze")
 def analyze_context(req: AnalyzeRequest):
     try:
@@ -629,6 +769,219 @@ def analyze_context(req: AnalyzeRequest):
 
     except Exception as exc:
         print(f"[BACKEND ERROR]: {exc}")
+        return {
+            "detected_type": "ERROR",
+            "cursor_pill": "High traffic — press hotkey again",
+            "copy_value": "",
+            "expanded_note": "",
+            "pointer_xy": None,
+            "key_source": "POOL",
+        }
+
+
+# ==============================================================================
+# V3 SMART ANTI-CLASH ROUTE (SPLIT TEXT/VISION QUOTA + 3-MIN QUIZ DEDUP + MODES)
+# ==============================================================================
+@app.post("/v3/analyze")
+def v3_analyze_context(req: V3AnalyzeRequest):
+    try:
+        mode = (req.action_mode or "solve").strip().lower()
+        sys_prompt = (
+            V3_REWRITE_PROMPT
+            if mode == "rewrite"
+            else V3_EXPLAIN_PROMPT
+            if mode == "explain"
+            else V3_SOLVE_PROMPT
+        )
+
+        contents_text = ""
+        img_pil = None
+        img_b64_str = None
+        raw_key = ""
+        quiz_hash = ""
+        is_followup = bool(req.follow_up and req.prior_context)
+        user_keys = parse_user_keys(req.user_api_key)
+        is_byok = bool(user_keys)
+
+        if is_followup:
+            contents_text = f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}"
+            raw_key = f"fu:{contents_text}"
+        elif req.image_base64:
+            clean_b64 = req.image_base64.split(",")[-1]
+            raw_key = f"{mode}:img:{hashlib.md5(clean_b64.encode()).hexdigest()}"
+
+            img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
+            img_pil.thumbnail((720, 720), Image.LANCZOS)
+
+            small_img = img_pil.copy()
+            small_img.thumbnail((512, 512), Image.BILINEAR)
+            buffer = BytesIO()
+            small_img.save(buffer, format="JPEG", quality=70)
+            img_b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+            contents_text = (
+                "Rewrite or reply to the highlighted message shown in this image."
+                if mode == "rewrite"
+                else "Explain the concept, code, or error shown in this image."
+                if mode == "explain"
+                else "Solve the primary problem shown in this image accurately."
+            )
+        elif req.text_content:
+            contents_text = f"Input:\n{req.text_content}"
+            raw_key = f"{mode}:txt:{req.text_content}"
+            if mode == "solve":
+                quiz_hash = normalize_quiz_hash(req.text_content)
+        else:
+            return {
+                "detected_type": "ERROR",
+                "cursor_pill": "Select text or snip area first",
+                "copy_value": "",
+                "expanded_note": "",
+                "pointer_xy": None,
+                "key_source": "BYOK" if is_byok else "POOL",
+            }
+
+        # 1. Exact payload dedup (10 min)
+        cache_key = hashlib.md5(raw_key.encode()).hexdigest()
+        image_hit = IMAGE_CACHE.get(cache_key)
+        if not is_followup and image_hit and time.time() - image_hit[0] < CACHE_TTL:
+            cached = dict(image_hit[1])
+            cached["key_source"] = "BYOK" if is_byok else "CACHE"
+            return cached
+
+        # 2. Cross-user 3-minute verified quiz cache (0-token burst protection for college quizzes)
+        if not is_followup and quiz_hash and quiz_hash in QUIZ_CACHE:
+            q_hit = QUIZ_CACHE[quiz_hash]
+            if time.time() - q_hit[0] < QUIZ_CACHE_TTL:
+                cached = dict(q_hit[1])
+                cached["key_source"] = "BYOK" if is_byok else "CACHE"
+                return cached
+
+        raw_json = None
+        errors = []
+        is_text_only = img_pil is None
+
+        if is_byok:
+            try:
+                raw_json = route_universal_byok(
+                    user_keys=user_keys,
+                    prompt_text=contents_text,
+                    img_pil=img_pil,
+                    img_b64=img_b64_str,
+                    deep=is_followup,
+                    sys_prompt=sys_prompt,
+                )
+            except Exception as exc:
+                err_msg = str(exc)
+                if "BYOK_INVALID" in err_msg:
+                    return {
+                        "detected_type": "ERROR",
+                        "cursor_pill": "Invalid key (use AIza / gsk_ / sk-)",
+                        "copy_value": "",
+                        "expanded_note": "",
+                        "pointer_xy": None,
+                        "key_source": "BYOK",
+                    }
+                return {
+                    "detected_type": "ERROR",
+                    "cursor_pill": "Personal key busy — retry",
+                    "copy_value": "",
+                    "expanded_note": "",
+                    "pointer_xy": None,
+                    "key_source": "BYOK",
+                }
+        elif is_text_only:
+            # TEXT QUOTA SHIELD: Route text/follow-ups to high-RPM Groq & Flash-Lite first,
+            # saving Gemini 3.8 Flash vision quota strictly for screenshot scans!
+            for g_key in get_keys("GROQ_API_KEY"):
+                try:
+                    raw_json = call_openai_compat(
+                        endpoint="https://api.groq.com/openai/v1/chat/completions",
+                        api_key=g_key,
+                        models=GROQ_TEXT_MODELS,
+                        prompt_text=contents_text,
+                        provider_tag="groq",
+                        is_byok=False,
+                        sys_prompt=sys_prompt,
+                    )
+                    if raw_json:
+                        break
+                except Exception as exc:
+                    errors.append(f"Groq: {exc}")
+
+            if not raw_json:
+                try:
+                    raw_json = call_gemini_keys(
+                        keys=get_keys("GEMINI_API_KEY"),
+                        prompt_text=contents_text,
+                        deep=is_followup,
+                        is_byok=False,
+                        sys_prompt=sys_prompt,
+                        prefer_fast=True,
+                    )
+                except Exception as exc:
+                    errors.append(f"Gemini: {exc}")
+
+            if not raw_json:
+                raw_json = _call_openrouter_pool(contents_text, sys_prompt=sys_prompt)
+        else:
+            # VISION QUOTA SHIELD: Route image scans to high-accuracy Gemini Vision -> Groq Vision -> OpenRouter Free Vision
+            try:
+                raw_json = call_gemini_keys(
+                    keys=get_keys("GEMINI_API_KEY"),
+                    prompt_text=contents_text,
+                    img_pil=img_pil,
+                    deep=is_followup,
+                    is_byok=False,
+                    sys_prompt=sys_prompt,
+                    prefer_fast=False,
+                )
+            except Exception as exc:
+                errors.append(f"Gemini: {exc}")
+
+            if not raw_json:
+                for g_key in get_keys("GROQ_API_KEY"):
+                    try:
+                        raw_json = call_openai_compat(
+                            endpoint="https://api.groq.com/openai/v1/chat/completions",
+                            api_key=g_key,
+                            models=GROQ_VISION_MODELS,
+                            prompt_text=contents_text,
+                            img_b64=img_b64_str,
+                            provider_tag="groq",
+                            is_byok=False,
+                            sys_prompt=sys_prompt,
+                        )
+                        if raw_json:
+                            break
+                    except Exception as exc:
+                        errors.append(f"Groq: {exc}")
+
+            if not raw_json:
+                raw_json = _call_openrouter_pool(
+                    contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt
+                )
+
+        if not raw_json:
+            raise RuntimeError(" | ".join(errors))
+
+        result = extract_json(raw_json, preserve_notes=True)
+        confidence = result.pop("confidence", "high")
+        result["key_source"] = "BYOK" if is_byok else "POOL"
+
+        IMAGE_CACHE[cache_key] = (time.time(), result)
+        if len(IMAGE_CACHE) > 300:
+            IMAGE_CACHE.pop(next(iter(IMAGE_CACHE)))
+
+        if not is_followup and quiz_hash and confidence == "high":
+            QUIZ_CACHE[quiz_hash] = (time.time(), result)
+            if len(QUIZ_CACHE) > 300:
+                QUIZ_CACHE.pop(next(iter(QUIZ_CACHE)))
+
+        return result
+
+    except Exception as exc:
+        print(f"[V3 BACKEND ERROR]: {exc}")
         return {
             "detected_type": "ERROR",
             "cursor_pill": "High traffic — press hotkey again",
