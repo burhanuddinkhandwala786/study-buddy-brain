@@ -227,6 +227,18 @@ def health():
     }
 
 
+@app.get("/cooldowns")
+def list_cooldowns():
+    now = time.time()
+    return {
+        "active": {
+            k: round(v - now)  # seconds remaining
+            for k, v in KEY_COOLDOWN.items()
+            if v > now
+        }
+    }
+
+
 @app.get("/diag")
 def diagnose_keys():
     report = {"gemini": [], "groq": "not_configured", "nvidia": "not_configured", "openrouter": "not_configured"}
