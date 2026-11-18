@@ -66,25 +66,24 @@ GROQ_VISION_MODELS = [
 ]
 
 NVIDIA_TEXT_MODELS = [
-    "meta/llama-3.3-70b-instruct",
-    "qwen/qwen2.5-72b-instruct",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
 ]
 
 NVIDIA_VISION_MODELS = [
-    "meta/llama-3.2-90b-vision-instruct",
-    "nvidia/nemotron-nano-12b-v2-vl",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "mistralai/mistral-large-4",
 ]
 
 OPENROUTER_TEXT_MODELS = [
-    "google/gemma-4-31b-it:free",
     "openrouter/free",
+    "google/gemma-4-31b-it:free",
 ]
 
 OPENROUTER_VISION_MODELS = [
-    "google/gemma-4-31b-it:free",
+    "openrouter/free",
     "nvidia/nemotron-3.5-super-vl:free",
 ]
-
 PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
 Solve step-by-step internally before outputting JSON:
 1. If multiple questions appear in a screenshot, focus ONLY on the primary/centered question.
