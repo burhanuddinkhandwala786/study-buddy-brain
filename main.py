@@ -421,7 +421,7 @@ def _classify_gemini_error(error_text: str) -> str:
     lowered = error_text.lower()
     if "429" in error_text or "resource_exhausted" in lowered or "quota" in lowered:
         return "rate_limit"
-    if "403" in error_text or "permission_denied" in lowered or "api_key_invalid" in lowered or "api key not valid" in lowered:
+    if "401" in error_text or "403" in error_text or "permission_denied" in lowered or "api_key_invalid" in lowered or "api key not valid" in lowered:
         return "forbidden"
     if "404" in error_text or "not_found" in lowered or "decommission" in lowered:
         return "model_unavailable"
