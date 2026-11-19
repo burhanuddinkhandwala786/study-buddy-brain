@@ -266,7 +266,7 @@ def diagnose_keys():
         try:
             client = _get_client(api_key)
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.5-flash-lite",
                 contents="Reply OK",
                 config=types.GenerateContentConfig(max_output_tokens=20),
             )
