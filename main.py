@@ -19,7 +19,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="4.9.0")
+app = FastAPI(title="Cursor Companion Brain", version="4.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_HTTP_CLIENT = httpx.Client(timeout=20.0)
+_HTTP_CLIENT = httpx.Client(timeout=16.0)
 
 IMAGE_CACHE = {}
 CACHE_TTL = 600
@@ -235,7 +235,7 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                client = genai.Client(api_key=api_key, http_options={"timeout": 20000})
+                client = genai.Client(api_key=api_key, http_options={"timeout": 18000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
 
@@ -246,7 +246,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v4.9-verified-strict-json",
+        "engine": "v4.9.1-quota-smart",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
@@ -266,7 +266,7 @@ def diagnose_keys():
             response = client.models.generate_content(
                 model="gemini-3.5-flash-lite",
                 contents="Reply OK",
-                config=types.GenerateContentConfig(max_output_tokens=20),
+                config=types.GenerateContentConfig(max_output_tokens=16),
             )
             report["gemini"].append({
                 "key": f"G{index} (...{api_key[-4:]})",
@@ -288,7 +288,7 @@ def diagnose_keys():
         keys = get_keys(env_name)
         if keys:
             try:
-                body = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 64}
+                body = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 32}
                 if tag == "groq" and "gpt-oss" in model:
                     body["reasoning_effort"] = "low"
                 r = _HTTP_CLIENT.post(
@@ -400,7 +400,7 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
 
     # Strict gate: never fall back to raw prose lines ("I need to think about it...") — fail over instead
     if not isinstance(data, dict) or not str(data.get("cursor_pill", "")).strip():
-        raise ValueError("Model returned prose/thinking instead of JSON")
+        raise ValueError("Model did not return valid JSON with cursor_pill")
 
     pill_str = str(data["cursor_pill"]).strip()
     data.setdefault("detected_type", "DIRECT_VALUE")
@@ -440,11 +440,12 @@ def _try_one_gemini(
     img_pil,
     use_thinking: bool,
     sys_prompt: str = PROMPT,
+    max_tokens: int = 400,
 ) -> str:
     cfg_kwargs = {
         "response_mime_type": "application/json",
         "temperature": 0.0,
-        "max_output_tokens": 1000,
+        "max_output_tokens": max_tokens,
     }
     if use_thinking:
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
@@ -484,6 +485,7 @@ def call_gemini_keys(
     deep: bool = False,
     is_byok: bool = False,
     sys_prompt: str = PROMPT,
+    max_tokens: int = 400,
 ) -> str:
     if not keys:
         raise RuntimeError("No Gemini keys configured")
@@ -491,11 +493,11 @@ def call_gemini_keys(
     now = time.time()
     start_idx = next(_KEY_CYCLE) % len(keys)
     ordered_keys = keys[start_idx:] + keys[:start_idx]
-    models = GEMINI_DEEP_MODELS if (deep or img_pil is not None) else GEMINI_FAST_MODELS
+    models = GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS
     last_error = "Gemini keys cooling down"
 
     for model_name in models:
-        use_thinking = (deep or img_pil is not None) and "lite" not in model_name
+        use_thinking = deep and "lite" not in model_name
         for api_key in ordered_keys:
             if KEY_COOLDOWN.get(api_key, 0) > now:
                 continue
@@ -505,7 +507,13 @@ def call_gemini_keys(
 
             try:
                 return _try_one_gemini(
-                    api_key, model_name, prompt_text, img_pil, use_thinking, sys_prompt=sys_prompt
+                    api_key,
+                    model_name,
+                    prompt_text,
+                    img_pil,
+                    use_thinking,
+                    sys_prompt=sys_prompt,
+                    max_tokens=max_tokens,
                 )
             except Exception as exc:
                 error_text = str(exc)
@@ -535,6 +543,7 @@ def call_openai_compat(
     provider_tag: str = "compat",
     is_byok: bool = False,
     sys_prompt: str = PROMPT,
+    max_tokens: int = 400,
 ) -> str:
     last_error = f"No {provider_tag} attempt succeeded"
 
@@ -566,7 +575,7 @@ def call_openai_compat(
             "model": model_id,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 1000,
+            "max_tokens": max_tokens,
         }
         if provider_tag == "groq" and "gpt-oss" in model_id:
             payload_body["reasoning_effort"] = "low"
@@ -625,6 +634,7 @@ def _route_server_byok(
     img_b64: Optional[str] = None,
     deep: bool = False,
     sys_prompt: str = PROMPT,
+    max_tokens: int = 400,
 ) -> str:
     gemini_keys = [k for k in user_keys if detect_key_provider(k) == "gemini"]
     groq_keys = [k for k in user_keys if detect_key_provider(k) == "groq"]
@@ -640,7 +650,13 @@ def _route_server_byok(
     if gemini_keys:
         try:
             return call_gemini_keys(
-                gemini_keys, prompt_text, img_pil=img_pil, deep=deep, is_byok=True, sys_prompt=sys_prompt
+                gemini_keys,
+                prompt_text,
+                img_pil=img_pil,
+                deep=deep,
+                is_byok=True,
+                sys_prompt=sys_prompt,
+                max_tokens=max_tokens,
             )
         except Exception as exc:
             errors.append(str(exc))
@@ -656,6 +672,7 @@ def _route_server_byok(
                 provider_tag="groq",
                 is_byok=True,
                 sys_prompt=sys_prompt,
+                max_tokens=max_tokens,
             )
         except Exception as exc:
             errors.append(str(exc))
@@ -671,6 +688,7 @@ def _route_server_byok(
                 provider_tag="nvidia",
                 is_byok=True,
                 sys_prompt=sys_prompt,
+                max_tokens=max_tokens,
             )
         except Exception as exc:
             errors.append(str(exc))
@@ -686,6 +704,7 @@ def _route_server_byok(
                 provider_tag="openrouter",
                 is_byok=True,
                 sys_prompt=sys_prompt,
+                max_tokens=max_tokens,
             )
         except Exception as exc:
             errors.append(str(exc))
@@ -701,6 +720,7 @@ def _route_server_byok(
                 provider_tag="openai",
                 is_byok=True,
                 sys_prompt=sys_prompt,
+                max_tokens=max_tokens,
             )
         except Exception as exc:
             errors.append(str(exc))
@@ -710,7 +730,12 @@ def _route_server_byok(
     raise RuntimeError("BYOK_LIMIT: " + (" | ".join(errors) if errors else "Personal key busy"))
 
 
-def _call_nvidia_pool(prompt_text: str, img_b64: Optional[str] = None, sys_prompt: str = PROMPT) -> Optional[str]:
+def _call_nvidia_pool(
+    prompt_text: str,
+    img_b64: Optional[str] = None,
+    sys_prompt: str = PROMPT,
+    max_tokens: int = 400,
+) -> Optional[str]:
     for nv_key in get_keys("NVIDIA_API_KEY"):
         try:
             res = call_openai_compat(
@@ -722,6 +747,7 @@ def _call_nvidia_pool(prompt_text: str, img_b64: Optional[str] = None, sys_promp
                 provider_tag="nvidia",
                 is_byok=False,
                 sys_prompt=sys_prompt,
+                max_tokens=max_tokens,
             )
             if res:
                 return res
@@ -730,7 +756,12 @@ def _call_nvidia_pool(prompt_text: str, img_b64: Optional[str] = None, sys_promp
     return None
 
 
-def _call_openrouter_pool(prompt_text: str, img_b64: Optional[str] = None, sys_prompt: str = PROMPT) -> Optional[str]:
+def _call_openrouter_pool(
+    prompt_text: str,
+    img_b64: Optional[str] = None,
+    sys_prompt: str = PROMPT,
+    max_tokens: int = 400,
+) -> Optional[str]:
     for or_key in get_keys("OPENROUTER_API_KEY"):
         try:
             res = call_openai_compat(
@@ -742,6 +773,7 @@ def _call_openrouter_pool(prompt_text: str, img_b64: Optional[str] = None, sys_p
                 provider_tag="openrouter",
                 is_byok=False,
                 sys_prompt=sys_prompt,
+                max_tokens=max_tokens,
             )
             if res:
                 return res
@@ -756,6 +788,7 @@ def _run_shared_cascade(
     img_b64_str: Optional[str],
     is_followup: bool,
     sys_prompt: str,
+    max_tokens: int = 400,
 ) -> str:
     errors = []
 
@@ -767,6 +800,7 @@ def _run_shared_cascade(
             deep=is_followup,
             is_byok=False,
             sys_prompt=sys_prompt,
+            max_tokens=max_tokens,
         )
     except Exception as exc:
         errors.append(f"Gemini: {exc}")
@@ -782,17 +816,18 @@ def _run_shared_cascade(
                 provider_tag="groq",
                 is_byok=False,
                 sys_prompt=sys_prompt,
+                max_tokens=max_tokens,
             )
             if raw_json:
                 return raw_json
         except Exception as exc:
             errors.append(f"Groq: {exc}")
 
-    raw_nv = _call_nvidia_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+    raw_nv = _call_nvidia_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_tokens=max_tokens)
     if raw_nv:
         return raw_nv
 
-    raw_or = _call_openrouter_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+    raw_or = _call_openrouter_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_tokens=max_tokens)
     if raw_or:
         return raw_or
 
@@ -808,6 +843,8 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
         if mode == "explain"
         else (V3_SOLVE_PROMPT if preserve_notes else PROMPT)
     )
+    is_followup = bool(req.follow_up and req.prior_context)
+    max_tokens = 650 if (mode == "explain" or is_followup) else 400
 
     user_keys = parse_user_keys(req.user_api_key)
     is_byok = bool(user_keys)
@@ -829,7 +866,6 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
     img_b64_str = None
     raw_key = ""
     quiz_hash = ""
-    is_followup = bool(req.follow_up and req.prior_context)
 
     if is_followup:
         contents_text = f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}"
@@ -905,6 +941,7 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
                 img_b64=img_b64_str,
                 deep=is_followup,
                 sys_prompt=sys_prompt,
+                max_tokens=max_tokens,
             )
         except Exception as exc:
             err_msg = str(exc)
@@ -932,6 +969,7 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
             img_b64_str=img_b64_str,
             is_followup=is_followup,
             sys_prompt=sys_prompt,
+            max_tokens=max_tokens,
         )
 
     result = extract_json(raw_json, preserve_notes=True)
