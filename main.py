@@ -47,8 +47,8 @@ _DB_LOCK = threading.Lock()
 _DB_PATH = "/tmp/companion_brain_cache_v9.db"
 
 GEMINI_FAST_MODELS = [
-    "gemini-3.8-flash",
     "gemini-3.5-flash",
+    "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
 ]
 
