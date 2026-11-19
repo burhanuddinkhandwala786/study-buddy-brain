@@ -7,6 +7,7 @@ import sqlite3
 import hashlib
 import itertools
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from typing import Optional
 
@@ -19,7 +20,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="5.0.0")
+app = FastAPI(title="Cursor Companion Brain", version="5.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,12 +30,13 @@ app.add_middleware(
 )
 
 _HTTP_CLIENT = httpx.Client(timeout=20.0)
+_HEDGE_POOL = ThreadPoolExecutor(max_workers=16)
 
 IMAGE_CACHE = {}
 CACHE_TTL = 600
 
 QUIZ_CACHE = {}
-QUIZ_CACHE_TTL = 1800
+QUIZ_CACHE_TTL = 3600
 
 KEY_COOLDOWN = {}
 _KEY_CYCLE = itertools.count()
@@ -42,7 +44,7 @@ _KEY_CYCLE = itertools.count()
 _GEMINI_CLIENTS = {}
 _GEMINI_CLIENTS_LOCK = threading.Lock()
 _DB_LOCK = threading.Lock()
-_DB_PATH = "/tmp/companion_brain_cache_v8.db"
+_DB_PATH = "/tmp/companion_brain_cache_v9.db"
 
 GEMINI_FAST_MODELS = [
     "gemini-3.5-flash-lite",
@@ -93,7 +95,7 @@ Accuracy is #1. Solve step-by-step internally before outputting JSON:
 2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
 3. Independently verify the factual or mathematical answer BEFORE looking at any highlighted/selected radio buttons.
 4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option (e.g. "D. both b and c").
-5. If text/image is cut off or illegible, return cursor_pill "Unclear crop — retry".
+5. Only if the question stem or options are physically cut off or completely illegible, return cursor_pill "Unclear crop — retry".
 
 Return ONLY valid JSON:
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"","pointer_xy":null}
@@ -109,10 +111,10 @@ Accuracy is #1. Solve step-by-step internally before outputting JSON:
 2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
 3. Independently verify the factual or mathematical answer BEFORE looking at any highlighted/selected radio buttons.
 4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option (e.g. "D. both b and c").
-5. If text/image is cut off or illegible, return cursor_pill "Unclear crop — retry" and confidence "low".
+5. Only if the question stem or options are physically cut off or completely illegible, return cursor_pill "Unclear crop — retry" and confidence "low".
 
 Return ONLY valid JSON:
-{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high"|"medium","pointer_xy":null}
+{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high"|"medium"|"low","pointer_xy":null}
 
 Strict Output Rules:
 - IF ANY OPTIONS (A/B/C/D/E or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "B. steel"), copy_value="", expanded_note = 1 short sentence explaining why.
@@ -185,9 +187,10 @@ def get_keys(env_name: str):
 
 
 def parse_user_keys(raw_user_keys: Optional[str]):
+    cleaned_raw = re.sub(r"\b(?:bearer|api_key|key)\s*[:=]?\s*", "", raw_user_keys or "", flags=re.I)
     return [
         key.strip().strip('"').strip("'")
-        for key in re.split(r"[\s,;]+", raw_user_keys or "")
+        for key in re.split(r"[\s,;]+", cleaned_raw)
         if key.strip().strip('"').strip("'")
     ]
 
@@ -215,7 +218,7 @@ def normalize_quiz_hash(text: str) -> str:
     )
     words = re.findall(r"[a-z0-9]+", s.lower())
     cleaned = "".join(words)
-    return hashlib.md5(f"v8:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
+    return hashlib.md5(f"v9:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 35 and len(words) >= 5) else ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -248,7 +251,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v5.0-rocksolid",
+        "engine": "v5.1-rocksolid-v31",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
@@ -421,7 +424,13 @@ def _classify_gemini_error(error_text: str) -> str:
     lowered = error_text.lower()
     if "429" in error_text or "resource_exhausted" in lowered or "quota" in lowered:
         return "rate_limit"
-    if "401" in error_text or "403" in error_text or "permission_denied" in lowered or "api_key_invalid" in lowered or "api key not valid" in lowered:
+    if (
+        "401" in error_text
+        or "403" in error_text
+        or "permission_denied" in lowered
+        or "api_key_invalid" in lowered
+        or "api key not valid" in lowered
+    ):
         return "forbidden"
     if "404" in error_text or "not_found" in lowered or "decommission" in lowered:
         return "model_unavailable"
@@ -705,6 +714,26 @@ def _route_server_byok(
     raise RuntimeError("BYOK_LIMIT: " + (" | ".join(errors) if errors else "Personal key busy"))
 
 
+def _call_groq_pool(prompt_text: str, img_b64: Optional[str] = None, sys_prompt: str = PROMPT) -> Optional[str]:
+    for g_key in get_keys("GROQ_API_KEY"):
+        try:
+            res = call_openai_compat(
+                endpoint="https://api.groq.com/openai/v1/chat/completions",
+                api_key=g_key,
+                models=GROQ_VISION_MODELS if img_b64 else GROQ_TEXT_MODELS,
+                prompt_text=prompt_text,
+                img_b64=img_b64,
+                provider_tag="groq",
+                is_byok=False,
+                sys_prompt=sys_prompt,
+            )
+            if res:
+                return res
+        except Exception:
+            continue
+    return None
+
+
 def _call_nvidia_pool(prompt_text: str, img_b64: Optional[str] = None, sys_prompt: str = PROMPT) -> Optional[str]:
     for nv_key in get_keys("NVIDIA_API_KEY"):
         try:
@@ -751,9 +780,45 @@ def _run_shared_cascade(
     img_b64_str: Optional[str],
     is_followup: bool,
     sys_prompt: str,
+    hedged: bool = False,
 ) -> str:
-    errors = []
+    if hedged:
+        done_event = threading.Event()
 
+        def _gemini_branch():
+            return call_gemini_keys(
+                keys=get_keys("GEMINI_API_KEY"),
+                prompt_text=contents_text,
+                img_pil=img_pil,
+                deep=is_followup,
+                is_byok=False,
+                sys_prompt=sys_prompt,
+            )
+
+        def _groq_staggered_branch():
+            # Wait 1.3s so Gemini handles ~85% of calls solo without burning Groq tokens unless Gemini lags
+            if done_event.wait(1.3):
+                raise RuntimeError("Cancelled")
+            res = _call_groq_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+            if not res:
+                raise RuntimeError("Groq unavailable")
+            return res
+
+        futures = [
+            _HEDGE_POOL.submit(_gemini_branch),
+            _HEDGE_POOL.submit(_groq_staggered_branch),
+        ]
+        for fut in as_completed(futures):
+            try:
+                out = fut.result()
+                if out:
+                    done_event.set()
+                    return out
+            except Exception:
+                continue
+        done_event.set()
+
+    errors = []
     try:
         return call_gemini_keys(
             keys=get_keys("GEMINI_API_KEY"),
@@ -766,22 +831,9 @@ def _run_shared_cascade(
     except Exception as exc:
         errors.append(f"Gemini: {exc}")
 
-    for g_key in get_keys("GROQ_API_KEY"):
-        try:
-            raw_json = call_openai_compat(
-                endpoint="https://api.groq.com/openai/v1/chat/completions",
-                api_key=g_key,
-                models=GROQ_VISION_MODELS if img_b64_str else GROQ_TEXT_MODELS,
-                prompt_text=contents_text,
-                img_b64=img_b64_str,
-                provider_tag="groq",
-                is_byok=False,
-                sys_prompt=sys_prompt,
-            )
-            if raw_json:
-                return raw_json
-        except Exception as exc:
-            errors.append(f"Groq: {exc}")
+    raw_groq = _call_groq_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+    if raw_groq:
+        return raw_groq
 
     raw_nv = _call_nvidia_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
     if raw_nv:
@@ -794,7 +846,13 @@ def _run_shared_cascade(
     raise RuntimeError(" | ".join(errors) or "All providers busy")
 
 
-def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_notes: bool = False) -> dict:
+def _unified_execute(
+    req: AnalyzeRequest,
+    action_mode: str = "solve",
+    preserve_notes: bool = False,
+    high_res_vision: bool = False,
+    hedged: bool = False,
+) -> dict:
     mode = (action_mode or "solve").strip().lower()
     sys_prompt = (
         V3_REWRITE_PROMPT
@@ -834,12 +892,14 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
         raw_key = f"{mode}:img:{hashlib.md5(clean_b64.encode()).hexdigest()}"
 
         img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-        img_pil.thumbnail((720, 720), Image.LANCZOS)
+        max_dim = 1024 if high_res_vision else 720
+        img_pil.thumbnail((max_dim, max_dim), Image.LANCZOS)
 
         small_img = img_pil.copy()
-        small_img.thumbnail((480, 480), Image.BILINEAR)
+        compat_dim = 960 if high_res_vision else 480
+        small_img.thumbnail((compat_dim, compat_dim), Image.BILINEAR)
         buffer = BytesIO()
-        small_img.save(buffer, format="JPEG", quality=68)
+        small_img.save(buffer, format="JPEG", quality=84 if high_res_vision else 68)
         img_b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
         contents_text = (
@@ -864,7 +924,7 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
             "key_source": "BYOK" if is_byok else "POOL",
         }
 
-    cache_key = hashlib.md5(f"v8:{raw_key}".encode()).hexdigest()
+    cache_key = hashlib.md5(f"v9:{raw_key}".encode()).hexdigest()
     image_hit = IMAGE_CACHE.get(cache_key)
     if not is_followup and image_hit and time.time() - image_hit[0] < CACHE_TTL:
         cached = dict(image_hit[1])
@@ -927,6 +987,7 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
             img_b64_str=img_b64_str,
             is_followup=is_followup,
             sys_prompt=sys_prompt,
+            hedged=hedged,
         )
 
     result = extract_json(raw_json, preserve_notes=True)
@@ -935,12 +996,12 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
 
     if not re.search(r"unclear crop", result.get("cursor_pill", ""), re.I):
         IMAGE_CACHE[cache_key] = (time.time(), dict(result))
-        if len(IMAGE_CACHE) > 400:
+        if len(IMAGE_CACHE) > 500:
             IMAGE_CACHE.pop(next(iter(IMAGE_CACHE)))
 
         if not is_followup and quiz_hash and confidence == "high":
             QUIZ_CACHE[quiz_hash] = (time.time(), dict(result))
-            if len(QUIZ_CACHE) > 500:
+            if len(QUIZ_CACHE) > 800:
                 QUIZ_CACHE.pop(next(iter(QUIZ_CACHE)))
             _db_put(quiz_hash, dict(result))
 
@@ -972,6 +1033,28 @@ def v3_analyze_context(req: V3AnalyzeRequest):
         return _unified_execute(req, action_mode=req.action_mode or "solve", preserve_notes=True)
     except Exception as exc:
         print(f"[V3 BACKEND ERROR]: {exc}")
+        return {
+            "detected_type": "ERROR",
+            "cursor_pill": "High traffic — press hotkey again",
+            "copy_value": "",
+            "expanded_note": str(exc)[:260],
+            "pointer_xy": None,
+            "key_source": "POOL",
+        }
+
+
+@app.post("/v3_1/analyze")
+def v3_1_analyze_context(req: V3AnalyzeRequest):
+    try:
+        return _unified_execute(
+            req,
+            action_mode=req.action_mode or "solve",
+            preserve_notes=True,
+            high_res_vision=True,
+            hedged=True,
+        )
+    except Exception as exc:
+        print(f"[V3.1 BACKEND ERROR]: {exc}")
         return {
             "detected_type": "ERROR",
             "cursor_pill": "High traffic — press hotkey again",
