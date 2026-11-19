@@ -240,7 +240,7 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                client = genai.Client(api_key=api_key, http_options={"timeout": 10000})
+                client = genai.Client(api_key=api_key, http_options={"timeout": 12000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
 
