@@ -425,7 +425,15 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
 
 def _classify_gemini_error(error_text: str) -> str:
     lowered = error_text.lower()
-    if "429" in error_text or "resource_exhausted" in lowered or "quota" in lowered:
+    if (
+        "429" in error_text
+        or "503" in error_text
+        or "504" in error_text
+        or "resource_exhausted" in lowered
+        or "quota" in lowered
+        or "unavailable" in lowered
+        or "deadline_exceeded" in lowered
+    ):
         return "rate_limit"
     if (
         "401" in error_text
