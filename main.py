@@ -193,7 +193,7 @@ def parse_user_keys(raw_user_keys: Optional[str]):
 
 
 def detect_key_provider(api_key: str) -> str:
-    if api_key.startswith("AIza"):
+    if api_key.startswith(("AIza", "AQ.")):
         return "gemini"
     if api_key.startswith("gsk_"):
         return "groq"
