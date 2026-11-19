@@ -19,7 +19,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="4.8.0")
+app = FastAPI(title="Cursor Companion Brain", version="4.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_HTTP_CLIENT = httpx.Client(timeout=16.0)
+_HTTP_CLIENT = httpx.Client(timeout=20.0)
 
 IMAGE_CACHE = {}
 CACHE_TTL = 600
@@ -42,7 +42,7 @@ _KEY_CYCLE = itertools.count()
 _GEMINI_CLIENTS = {}
 _GEMINI_CLIENTS_LOCK = threading.Lock()
 _DB_LOCK = threading.Lock()
-_DB_PATH = "/tmp/companion_brain_cache_v6.db"
+_DB_PATH = "/tmp/companion_brain_cache_v7.db"
 
 GEMINI_FAST_MODELS = [
     "gemini-3.5-flash-lite",
@@ -213,7 +213,7 @@ def normalize_quiz_hash(text: str) -> str:
     )
     words = re.findall(r"[a-z0-9]+", s.lower())
     cleaned = "".join(words)
-    return hashlib.md5(f"v6:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
+    return hashlib.md5(f"v7:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -235,7 +235,7 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                client = genai.Client(api_key=api_key, http_options={"timeout": 18000})
+                client = genai.Client(api_key=api_key, http_options={"timeout": 20000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
 
@@ -246,7 +246,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v4.8-enterprise-strict-json",
+        "engine": "v4.9-verified-strict-json",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
@@ -266,7 +266,7 @@ def diagnose_keys():
             response = client.models.generate_content(
                 model="gemini-3.5-flash-lite",
                 contents="Reply OK",
-                config=types.GenerateContentConfig(max_output_tokens=10),
+                config=types.GenerateContentConfig(max_output_tokens=20),
             )
             report["gemini"].append({
                 "key": f"G{index} (...{api_key[-4:]})",
@@ -288,7 +288,7 @@ def diagnose_keys():
         keys = get_keys(env_name)
         if keys:
             try:
-                body = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 32}
+                body = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 64}
                 if tag == "groq" and "gpt-oss" in model:
                     body["reasoning_effort"] = "low"
                 r = _HTTP_CLIENT.post(
@@ -388,11 +388,13 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
             copy_match = re.search(r'"copy_value"\s*:\s*"([^"]*)"', cleaned)
             note_match = re.search(r'"expanded_note"\s*:\s*"([^"]*)"', cleaned)
             type_match = re.search(r'"detected_type"\s*:\s*"([^"]+)"', cleaned)
+            conf_match = re.search(r'"confidence"\s*:\s*"([^"]+)"', cleaned)
             data = {
                 "detected_type": type_match.group(1) if type_match else "DIRECT_VALUE",
                 "cursor_pill": pill_val,
                 "copy_value": copy_match.group(1) if copy_match else pill_val,
                 "expanded_note": note_match.group(1) if note_match else "",
+                "confidence": conf_match.group(1) if conf_match else "high",
                 "pointer_xy": None,
             }
 
@@ -405,6 +407,7 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
     data["cursor_pill"] = pill_str
     data.setdefault("copy_value", "")
     data.setdefault("expanded_note", "")
+    data.setdefault("confidence", "high")
     data.setdefault("pointer_xy", None)
 
     if not preserve_notes and data.get("detected_type") in ("MCQ", "DIRECT_VALUE", "CODE_FIX"):
@@ -441,7 +444,7 @@ def _try_one_gemini(
     cfg_kwargs = {
         "response_mime_type": "application/json",
         "temperature": 0.0,
-        "max_output_tokens": 900 if use_thinking else 420,
+        "max_output_tokens": 1000,
     }
     if use_thinking:
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
@@ -510,7 +513,7 @@ def call_gemini_keys(
                 err_type = _classify_gemini_error(error_text)
 
                 if err_type == "rate_limit":
-                    KEY_COOLDOWN[model_cd_key] = time.time() + 45
+                    KEY_COOLDOWN[model_cd_key] = time.time() + 25
                 elif err_type == "forbidden":
                     KEY_COOLDOWN[api_key] = time.time() + 3600
                 elif err_type == "model_unavailable":
@@ -563,7 +566,7 @@ def call_openai_compat(
             "model": model_id,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 800,
+            "max_tokens": 1000,
         }
         if provider_tag == "groq" and "gpt-oss" in model_id:
             payload_body["reasoning_effort"] = "low"
@@ -606,7 +609,7 @@ def call_openai_compat(
                 raise RuntimeError("BYOK_INVALID: Invalid personal API key (Alt+K)")
             break
         if response.status_code == 429:
-            KEY_COOLDOWN[cooldown_key] = time.time() + 30
+            KEY_COOLDOWN[cooldown_key] = time.time() + 25
         elif response.status_code in (400, 404, 410):
             KEY_COOLDOWN[cooldown_key] = time.time() + 86400
 
@@ -866,7 +869,7 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
             "key_source": "BYOK" if is_byok else "POOL",
         }
 
-    cache_key = hashlib.md5(f"v6:{raw_key}".encode()).hexdigest()
+    cache_key = hashlib.md5(f"v7:{raw_key}".encode()).hexdigest()
     image_hit = IMAGE_CACHE.get(cache_key)
     if not is_followup and image_hit and time.time() - image_hit[0] < CACHE_TTL:
         cached = dict(image_hit[1])
