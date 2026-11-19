@@ -47,9 +47,9 @@ _DB_LOCK = threading.Lock()
 _DB_PATH = "/tmp/companion_brain_cache_v9.db"
 
 GEMINI_FAST_MODELS = [
-    "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
 ]
 
 GEMINI_DEEP_MODELS = [
@@ -90,15 +90,15 @@ OPENROUTER_VISION_MODELS = [
 ]
 
 PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
-Accuracy is #1. Solve step-by-step internally before outputting JSON:
-1. If multiple questions appear in a screenshot, focus ONLY on the primary/centered question.
+Accuracy is #1. You MUST fill the "verification" field FIRST before choosing "cursor_pill":
+1. Focus ONLY on the primary/centered question.
 2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
 3. Independently verify the factual or mathematical answer BEFORE looking at any highlighted/selected radio buttons.
-4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option (e.g. "D. both b and c").
-5. Only if the question stem or options are physically cut off or completely illegible, return cursor_pill "Unclear crop — retry".
+4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option.
+5. Only if the question stem or options are physically cut off or illegible, return cursor_pill "Unclear crop — retry".
 
 Return ONLY valid JSON:
-{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"","pointer_xy":null}
+{"verification":"concise step-by-step check","detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"","pointer_xy":null}
 
 Strict Output Rules:
 - IF ANY OPTIONS (A/B/C/D/E or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "B. steel" or "D. both b and c"), copy_value="", expanded_note="".
@@ -106,15 +106,15 @@ Strict Output Rules:
 - CONCEPT_EXPLAIN (only when user explicitly asks "explain" or "why" in follow-up): cursor_pill = 1-line summary; expanded_note = 2 short bullet points."""
 
 V3_SOLVE_PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
-Accuracy is #1. Solve step-by-step internally before outputting JSON:
-1. If multiple questions appear in a screenshot, focus ONLY on the primary/centered question.
+Accuracy is #1. You MUST fill the "verification" field FIRST before choosing "cursor_pill":
+1. Focus ONLY on the primary/centered question.
 2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
 3. Independently verify the factual or mathematical answer BEFORE looking at any highlighted/selected radio buttons.
-4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option (e.g. "D. both b and c").
-5. Only if the question stem or options are physically cut off or completely illegible, return cursor_pill "Unclear crop — retry" and confidence "low".
+4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option.
+5. Only if the question stem or options are physically cut off or illegible, return cursor_pill "Unclear crop — retry" and confidence "low".
 
 Return ONLY valid JSON:
-{"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high"|"medium"|"low","pointer_xy":null}
+{"verification":"concise step-by-step check","detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high"|"medium","pointer_xy":null}
 
 Strict Output Rules:
 - IF ANY OPTIONS (A/B/C/D/E or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "B. steel"), copy_value="", expanded_note = 1 short sentence explaining why.
@@ -448,10 +448,10 @@ def _try_one_gemini(
     cfg_kwargs = {
         "response_mime_type": "application/json",
         "temperature": 0.0,
-        "max_output_tokens": 650,
+        "max_output_tokens": 1200,
     }
     if use_thinking:
-        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
+        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=1024)
 
     client = _get_client(api_key)
     contents = [sys_prompt, prompt_text] + ([img_pil] if img_pil is not None else [])
