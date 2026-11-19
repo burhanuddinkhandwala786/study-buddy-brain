@@ -20,7 +20,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="5.1.0")
+app = FastAPI(title="Cursor Companion Brain", version="5.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,11 +29,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_HTTP_CLIENT = httpx.Client(timeout=20.0)
+_HTTP_CLIENT = httpx.Client(timeout=10.5)
 _HEDGE_POOL = ThreadPoolExecutor(max_workers=16)
 
 IMAGE_CACHE = {}
-CACHE_TTL = 600
+CACHE_TTL = 900
 
 QUIZ_CACHE = {}
 QUIZ_CACHE_TTL = 3600
@@ -44,7 +44,7 @@ _KEY_CYCLE = itertools.count()
 _GEMINI_CLIENTS = {}
 _GEMINI_CLIENTS_LOCK = threading.Lock()
 _DB_LOCK = threading.Lock()
-_DB_PATH = "/tmp/companion_brain_cache_v9.db"
+_DB_PATH = "/tmp/companion_brain_cache_v10.db"
 
 GEMINI_FAST_MODELS = [
     "gemini-3.5-flash",
@@ -123,12 +123,12 @@ Strict Output Rules:
 
 V3_REWRITE_PROMPT = """Rewrite the provided text clearly and politely.
 Output ONLY a single raw JSON object:
-{"detected_type":"REWRITE","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
+{"verification":"tone checked","detected_type":"REWRITE","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
 Rules: cursor_pill = 1-line preview (max 65 chars); copy_value = complete rewritten text; expanded_note = brief tone note."""
 
 V3_EXPLAIN_PROMPT = """Explain the provided concept, code, or error clearly in plain English.
 Output ONLY a single raw JSON object:
-{"detected_type":"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
+{"verification":"facts checked","detected_type":"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
 Rules: cursor_pill = 1-line takeaway (max 70 chars); copy_value = same takeaway; expanded_note = 3 short bullet points."""
 
 
@@ -218,7 +218,7 @@ def normalize_quiz_hash(text: str) -> str:
     )
     words = re.findall(r"[a-z0-9]+", s.lower())
     cleaned = "".join(words)
-    return hashlib.md5(f"v9:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 35 and len(words) >= 5) else ""
+    return hashlib.md5(f"v10:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 35 and len(words) >= 5) else ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -240,7 +240,7 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                client = genai.Client(api_key=api_key, http_options={"timeout": 20000})
+                client = genai.Client(api_key=api_key, http_options={"timeout": 10000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
 
@@ -251,7 +251,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v5.1-rocksolid-v31",
+        "engine": "v5.2.0-rocksolid-v31",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
@@ -319,7 +319,7 @@ def self_test():
             endpoint="https://api.groq.com/openai/v1/chat/completions",
             api_key=get_keys("GROQ_API_KEY")[0],
             models=GROQ_TEXT_MODELS,
-            prompt_text='Return JSON: {"detected_type":"DIRECT_VALUE","cursor_pill":"2","copy_value":"2","expanded_note":"","pointer_xy":null}',
+            prompt_text='Return JSON: {"verification":"ok","detected_type":"DIRECT_VALUE","cursor_pill":"2","copy_value":"2","expanded_note":"","pointer_xy":null}',
             provider_tag="groq",
         )
         results["groq_pipeline"] = {"status": "200 OK", "output": extract_json(raw_groq).get("cursor_pill")}
@@ -329,7 +329,7 @@ def self_test():
     try:
         raw_gemini = call_gemini_keys(
             keys=get_keys("GEMINI_API_KEY"),
-            prompt_text='Return JSON: {"detected_type":"DIRECT_VALUE","cursor_pill":"4","copy_value":"4","expanded_note":"","pointer_xy":null}',
+            prompt_text='Return JSON: {"verification":"ok","detected_type":"DIRECT_VALUE","cursor_pill":"4","copy_value":"4","expanded_note":"","pointer_xy":null}',
             is_byok=False,
         )
         results["gemini_pipeline"] = {"status": "200 OK", "output": extract_json(raw_gemini).get("cursor_pill")}
@@ -406,6 +406,9 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
     if not isinstance(data, dict) or not str(data.get("cursor_pill", "")).strip():
         raise ValueError("Model returned prose/thinking instead of JSON")
 
+    # Remove internal verification scratchpad so client payload stays lean
+    data.pop("verification", None)
+
     pill_str = str(data["cursor_pill"]).strip()
     data.setdefault("detected_type", "DIRECT_VALUE")
     data["cursor_pill"] = pill_str
@@ -445,13 +448,13 @@ def _try_one_gemini(
     use_thinking: bool,
     sys_prompt: str = PROMPT,
 ) -> str:
+    # Omit temperature on Gemini 3.x to prevent reasoning loops; cap max_output_tokens at 850 to protect free-tier quota
     cfg_kwargs = {
         "response_mime_type": "application/json",
-        "temperature": 0.0,
-        "max_output_tokens": 1200,
+        "max_output_tokens": 850,
     }
     if use_thinking:
-        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=1024)
+        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
 
     client = _get_client(api_key)
     contents = [sys_prompt, prompt_text] + ([img_pil] if img_pil is not None else [])
@@ -517,7 +520,7 @@ def call_gemini_keys(
                 err_type = _classify_gemini_error(error_text)
 
                 if err_type == "rate_limit":
-                    KEY_COOLDOWN[model_cd_key] = time.time() + 20
+                    KEY_COOLDOWN[model_cd_key] = time.time() + 25
                 elif err_type == "forbidden":
                     KEY_COOLDOWN[api_key] = time.time() + 3600
                 elif err_type == "model_unavailable":
@@ -570,7 +573,7 @@ def call_openai_compat(
             "model": model_id,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 650,
+            "max_tokens": 950,
         }
         if provider_tag == "groq" and "gpt-oss" in model_id:
             payload_body["reasoning_effort"] = "medium"
@@ -613,7 +616,7 @@ def call_openai_compat(
                 raise RuntimeError("BYOK_INVALID: Invalid personal API key (Alt+K)")
             break
         if response.status_code == 429:
-            KEY_COOLDOWN[cooldown_key] = time.time() + 20
+            KEY_COOLDOWN[cooldown_key] = time.time() + 25
         elif response.status_code in (400, 404, 410):
             KEY_COOLDOWN[cooldown_key] = time.time() + 86400
 
@@ -796,8 +799,8 @@ def _run_shared_cascade(
             )
 
         def _groq_staggered_branch():
-            # Wait 1.3s so Gemini handles ~85% of calls solo without burning Groq tokens unless Gemini lags
-            if done_event.wait(1.3):
+            # Wait 1.6s so Gemini handles ~90% of calls solo without burning Groq free-tier tokens unless Gemini lags
+            if done_event.wait(1.6):
                 raise RuntimeError("Cancelled")
             res = _call_groq_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
             if not res:
@@ -892,14 +895,15 @@ def _unified_execute(
         raw_key = f"{mode}:img:{hashlib.md5(clean_b64.encode()).hexdigest()}"
 
         img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-        max_dim = 1024 if high_res_vision else 720
+        # 800px @ q76 keeps small exam text sharp while cutting vision upload latency & token spend
+        max_dim = 800 if high_res_vision else 720
         img_pil.thumbnail((max_dim, max_dim), Image.LANCZOS)
 
         small_img = img_pil.copy()
-        compat_dim = 960 if high_res_vision else 480
+        compat_dim = 768 if high_res_vision else 480
         small_img.thumbnail((compat_dim, compat_dim), Image.BILINEAR)
         buffer = BytesIO()
-        small_img.save(buffer, format="JPEG", quality=84 if high_res_vision else 68)
+        small_img.save(buffer, format="JPEG", quality=76 if high_res_vision else 68)
         img_b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
         contents_text = (
@@ -924,7 +928,7 @@ def _unified_execute(
             "key_source": "BYOK" if is_byok else "POOL",
         }
 
-    cache_key = hashlib.md5(f"v9:{raw_key}".encode()).hexdigest()
+    cache_key = hashlib.md5(f"v10:{raw_key}".encode()).hexdigest()
     image_hit = IMAGE_CACHE.get(cache_key)
     if not is_followup and image_hit and time.time() - image_hit[0] < CACHE_TTL:
         cached = dict(image_hit[1])
