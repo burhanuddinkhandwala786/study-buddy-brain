@@ -57,13 +57,14 @@ GEMINI_DEEP_MODELS = [
 ]
 
 GROQ_TEXT_MODELS = [
-    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
 ]
 
 GROQ_VISION_MODELS = [
-    "meta-llama/llama-4-scout-17b-16e-instruct",
     "qwen/qwen3.8-27b",
+    "openai/gpt-oss-120b",
 ]
 
 NVIDIA_TEXT_MODELS = [
