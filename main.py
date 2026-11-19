@@ -426,14 +426,14 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
 def _classify_gemini_error(error_text: str) -> str:
     lowered = error_text.lower()
     if (
-        "429" in error_text
-        or "503" in error_text
+        "503" in error_text
         or "504" in error_text
-        or "resource_exhausted" in lowered
-        or "quota" in lowered
         or "unavailable" in lowered
         or "deadline_exceeded" in lowered
+        or "timed out" in lowered
     ):
+        return "overload"
+    if "429" in error_text or "resource_exhausted" in lowered or "quota" in lowered:
         return "rate_limit"
     if (
         "401" in error_text
@@ -508,16 +508,21 @@ def call_gemini_keys(
     ordered_keys = keys[start_idx:] + keys[:start_idx]
     models = GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS
     last_error = "Gemini keys cooling down"
+    attempts = 0
+    max_attempts = 6 if is_byok else 2
 
     for model_name in models:
         use_thinking = "lite" not in model_name
         for api_key in ordered_keys:
+            if attempts >= max_attempts:
+                break
             if KEY_COOLDOWN.get(api_key, 0) > now:
                 continue
             model_cd_key = f"{api_key}:{model_name}"
             if KEY_COOLDOWN.get(model_cd_key, 0) > now:
                 continue
 
+            attempts += 1
             try:
                 return _try_one_gemini(
                     api_key, model_name, prompt_text, img_pil, use_thinking, sys_prompt=sys_prompt
@@ -527,12 +532,16 @@ def call_gemini_keys(
                 last_error = f"{model_name}: {error_text[:100]}"
                 err_type = _classify_gemini_error(error_text)
 
-                if err_type == "rate_limit":
+                if err_type == "overload":
+                    KEY_COOLDOWN[model_cd_key] = time.time() + 60
+                elif err_type == "rate_limit":
                     KEY_COOLDOWN[model_cd_key] = time.time() + 25
                 elif err_type == "forbidden":
                     KEY_COOLDOWN[api_key] = time.time() + 3600
                 elif err_type == "model_unavailable":
                     KEY_COOLDOWN[model_cd_key] = time.time() + 3600
+        if attempts >= max_attempts:
+            break
 
     if is_byok and all(KEY_COOLDOWN.get(k, 0) > time.time() for k in keys):
         raise RuntimeError("BYOK_INVALID: Invalid personal API key (Alt+K)")
@@ -785,6 +794,18 @@ def _call_openrouter_pool(prompt_text: str, img_b64: Optional[str] = None, sys_p
     return None
 
 
+def _has_ready_gemini(deep: bool = False) -> bool:
+    now = time.time()
+    models = GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS
+    for api_key in get_keys("GEMINI_API_KEY"):
+        if KEY_COOLDOWN.get(api_key, 0) > now:
+            continue
+        for model_name in models:
+            if KEY_COOLDOWN.get(f"{api_key}:{model_name}", 0) <= now:
+                return True
+    return False
+
+
 def _run_shared_cascade(
     contents_text: str,
     img_pil: Optional[Image.Image],
@@ -793,10 +814,62 @@ def _run_shared_cascade(
     sys_prompt: str,
     hedged: bool = False,
 ) -> str:
-    if hedged:
+    gemini_ready = _has_ready_gemini(deep=is_followup)
+    groq_tried = False
+    errors = []
+
+    if hedged and gemini_ready:
         done_event = threading.Event()
+        wake_groq = threading.Event()
 
         def _gemini_branch():
+            try:
+                res = call_gemini_keys(
+                    keys=get_keys("GEMINI_API_KEY"),
+                    prompt_text=contents_text,
+                    img_pil=img_pil,
+                    deep=is_followup,
+                    is_byok=False,
+                    sys_prompt=sys_prompt,
+                )
+                if res:
+                    done_event.set()
+                    wake_groq.set()
+                return res
+            except Exception:
+                wake_groq.set()
+                raise
+
+        def _groq_staggered_branch():
+            # Wait up to 1.6s, or wake immediately if Gemini errors out early
+            wake_groq.wait(1.6)
+            if done_event.is_set():
+                raise RuntimeError("Cancelled")
+            res = _call_groq_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+            if not res:
+                raise RuntimeError("Groq unavailable")
+            done_event.set()
+            return res
+
+        futures = [
+            _HEDGE_POOL.submit(_gemini_branch),
+            _HEDGE_POOL.submit(_groq_staggered_branch),
+        ]
+        groq_tried = True
+        for fut in as_completed(futures):
+            try:
+                out = fut.result()
+                if out:
+                    done_event.set()
+                    wake_groq.set()
+                    return out
+            except Exception as exc:
+                if str(exc) != "Cancelled":
+                    errors.append(str(exc))
+        done_event.set()
+        wake_groq.set()
+    elif gemini_ready:
+        try:
             return call_gemini_keys(
                 keys=get_keys("GEMINI_API_KEY"),
                 prompt_text=contents_text,
@@ -805,46 +878,13 @@ def _run_shared_cascade(
                 is_byok=False,
                 sys_prompt=sys_prompt,
             )
+        except Exception as exc:
+            errors.append(f"Gemini: {exc}")
 
-        def _groq_staggered_branch():
-            # Wait 1.6s so Gemini handles ~90% of calls solo without burning Groq free-tier tokens unless Gemini lags
-            if done_event.wait(1.6):
-                raise RuntimeError("Cancelled")
-            res = _call_groq_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
-            if not res:
-                raise RuntimeError("Groq unavailable")
-            return res
-
-        futures = [
-            _HEDGE_POOL.submit(_gemini_branch),
-            _HEDGE_POOL.submit(_groq_staggered_branch),
-        ]
-        for fut in as_completed(futures):
-            try:
-                out = fut.result()
-                if out:
-                    done_event.set()
-                    return out
-            except Exception:
-                continue
-        done_event.set()
-
-    errors = []
-    try:
-        return call_gemini_keys(
-            keys=get_keys("GEMINI_API_KEY"),
-            prompt_text=contents_text,
-            img_pil=img_pil,
-            deep=is_followup,
-            is_byok=False,
-            sys_prompt=sys_prompt,
-        )
-    except Exception as exc:
-        errors.append(f"Gemini: {exc}")
-
-    raw_groq = _call_groq_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
-    if raw_groq:
-        return raw_groq
+    if not groq_tried:
+        raw_groq = _call_groq_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+        if raw_groq:
+            return raw_groq
 
     raw_nv = _call_nvidia_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
     if raw_nv:
