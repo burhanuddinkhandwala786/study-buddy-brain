@@ -19,7 +19,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="4.9.0")
+app = FastAPI(title="Cursor Companion Brain", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,23 +42,25 @@ _KEY_CYCLE = itertools.count()
 _GEMINI_CLIENTS = {}
 _GEMINI_CLIENTS_LOCK = threading.Lock()
 _DB_LOCK = threading.Lock()
-_DB_PATH = "/tmp/companion_brain_cache_v7.db"
+_DB_PATH = "/tmp/companion_brain_cache_v8.db"
 
 GEMINI_FAST_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
+    "gemini-2.5-flash",
     "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash-lite",
 ]
 
 GEMINI_DEEP_MODELS = [
     "gemini-3.8-flash",
+    "gemini-2.5-flash",
     "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
 ]
 
 GROQ_TEXT_MODELS = [
-    "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
 ]
 
@@ -88,32 +90,34 @@ OPENROUTER_VISION_MODELS = [
 ]
 
 PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
-Solve step-by-step internally before outputting JSON:
+Accuracy is #1. Solve step-by-step internally before outputting JSON:
 1. If multiple questions appear in a screenshot, focus ONLY on the primary/centered question.
 2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
 3. Independently verify the factual or mathematical answer BEFORE looking at any highlighted/selected radio buttons.
 4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option (e.g. "D. both b and c").
+5. If text/image is cut off or illegible, return cursor_pill "Unclear crop — retry".
 
 Return ONLY valid JSON:
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"","pointer_xy":null}
 
 Strict Output Rules:
-- IF ANY OPTIONS (A/B/C/D/E or 1/2/3/4) ARE PRESENT: You MUST set detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. VAX" or "D. both b and c"), copy_value="", expanded_note="". NEVER output a long paragraph when options exist.
+- IF ANY OPTIONS (A/B/C/D/E or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "B. steel" or "D. both b and c"), copy_value="", expanded_note="".
 - DIRECT_VALUE / CODE_FIX (no options present): cursor_pill = concise verified answer or fixed code line; copy_value = raw answer; expanded_note="".
 - CONCEPT_EXPLAIN (only when user explicitly asks "explain" or "why" in follow-up): cursor_pill = 1-line summary; expanded_note = 2 short bullet points."""
 
 V3_SOLVE_PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
-Solve step-by-step internally before outputting JSON:
+Accuracy is #1. Solve step-by-step internally before outputting JSON:
 1. If multiple questions appear in a screenshot, focus ONLY on the primary/centered question.
 2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
 3. Independently verify the factual or mathematical answer BEFORE looking at any highlighted/selected radio buttons.
 4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option (e.g. "D. both b and c").
+5. If text/image is cut off or illegible, return cursor_pill "Unclear crop — retry" and confidence "low".
 
 Return ONLY valid JSON:
 {"detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high"|"medium","pointer_xy":null}
 
 Strict Output Rules:
-- IF ANY OPTIONS (A/B/C/D/E or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "C. VAX"), copy_value="", expanded_note = 1 short sentence explaining why.
+- IF ANY OPTIONS (A/B/C/D/E or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "B. steel"), copy_value="", expanded_note = 1 short sentence explaining why.
 - DIRECT_VALUE / CODE_FIX: cursor_pill = exact concise answer; copy_value = raw answer; expanded_note = 1 short sentence.
 - CONCEPT_EXPLAIN: cursor_pill = 1-line takeaway; copy_value = same takeaway; expanded_note = 3 short bullet points."""
 
@@ -213,7 +217,7 @@ def normalize_quiz_hash(text: str) -> str:
     )
     words = re.findall(r"[a-z0-9]+", s.lower())
     cleaned = "".join(words)
-    return hashlib.md5(f"v7:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
+    return hashlib.md5(f"v8:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -246,7 +250,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v4.9-verified-strict-json",
+        "engine": "v5.0-rocksolid",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
@@ -264,7 +268,7 @@ def diagnose_keys():
         try:
             client = _get_client(api_key)
             response = client.models.generate_content(
-                model="gemini-3.5-flash-lite",
+                model="gemini-2.5-flash",
                 contents="Reply OK",
                 config=types.GenerateContentConfig(max_output_tokens=20),
             )
@@ -398,7 +402,6 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
                 "pointer_xy": None,
             }
 
-    # Strict gate: never fall back to raw prose lines ("I need to think about it...") — fail over instead
     if not isinstance(data, dict) or not str(data.get("cursor_pill", "")).strip():
         raise ValueError("Model returned prose/thinking instead of JSON")
 
@@ -420,13 +423,7 @@ def _classify_gemini_error(error_text: str) -> str:
     lowered = error_text.lower()
     if "429" in error_text or "resource_exhausted" in lowered or "quota" in lowered:
         return "rate_limit"
-    if (
-        "400" in error_text
-        or "403" in error_text
-        or "permission_denied" in lowered
-        or "api_key_invalid" in lowered
-        or "api key not valid" in lowered
-    ):
+    if "403" in error_text or "permission_denied" in lowered or "api_key_invalid" in lowered or "api key not valid" in lowered:
         return "forbidden"
     if "404" in error_text or "not_found" in lowered or "decommission" in lowered:
         return "model_unavailable"
@@ -444,7 +441,7 @@ def _try_one_gemini(
     cfg_kwargs = {
         "response_mime_type": "application/json",
         "temperature": 0.0,
-        "max_output_tokens": 1000,
+        "max_output_tokens": 650,
     }
     if use_thinking:
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
@@ -491,11 +488,11 @@ def call_gemini_keys(
     now = time.time()
     start_idx = next(_KEY_CYCLE) % len(keys)
     ordered_keys = keys[start_idx:] + keys[:start_idx]
-    models = GEMINI_DEEP_MODELS if (deep or img_pil is not None) else GEMINI_FAST_MODELS
+    models = GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS
     last_error = "Gemini keys cooling down"
 
     for model_name in models:
-        use_thinking = (deep or img_pil is not None) and "lite" not in model_name
+        use_thinking = "lite" not in model_name
         for api_key in ordered_keys:
             if KEY_COOLDOWN.get(api_key, 0) > now:
                 continue
@@ -513,7 +510,7 @@ def call_gemini_keys(
                 err_type = _classify_gemini_error(error_text)
 
                 if err_type == "rate_limit":
-                    KEY_COOLDOWN[model_cd_key] = time.time() + 25
+                    KEY_COOLDOWN[model_cd_key] = time.time() + 20
                 elif err_type == "forbidden":
                     KEY_COOLDOWN[api_key] = time.time() + 3600
                 elif err_type == "model_unavailable":
@@ -566,10 +563,10 @@ def call_openai_compat(
             "model": model_id,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 1000,
+            "max_tokens": 650,
         }
         if provider_tag == "groq" and "gpt-oss" in model_id:
-            payload_body["reasoning_effort"] = "low"
+            payload_body["reasoning_effort"] = "medium"
         if provider_tag == "groq" and not img_b64:
             payload_body["response_format"] = {"type": "json_object"}
 
@@ -609,7 +606,7 @@ def call_openai_compat(
                 raise RuntimeError("BYOK_INVALID: Invalid personal API key (Alt+K)")
             break
         if response.status_code == 429:
-            KEY_COOLDOWN[cooldown_key] = time.time() + 25
+            KEY_COOLDOWN[cooldown_key] = time.time() + 20
         elif response.status_code in (400, 404, 410):
             KEY_COOLDOWN[cooldown_key] = time.time() + 86400
 
@@ -869,7 +866,7 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
             "key_source": "BYOK" if is_byok else "POOL",
         }
 
-    cache_key = hashlib.md5(f"v7:{raw_key}".encode()).hexdigest()
+    cache_key = hashlib.md5(f"v8:{raw_key}".encode()).hexdigest()
     image_hit = IMAGE_CACHE.get(cache_key)
     if not is_followup and image_hit and time.time() - image_hit[0] < CACHE_TTL:
         cached = dict(image_hit[1])
@@ -938,15 +935,16 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
     confidence = result.pop("confidence", "high")
     result["key_source"] = "BYOK" if is_byok else "POOL"
 
-    IMAGE_CACHE[cache_key] = (time.time(), dict(result))
-    if len(IMAGE_CACHE) > 400:
-        IMAGE_CACHE.pop(next(iter(IMAGE_CACHE)))
+    if not re.search(r"unclear crop", result.get("cursor_pill", ""), re.I):
+        IMAGE_CACHE[cache_key] = (time.time(), dict(result))
+        if len(IMAGE_CACHE) > 400:
+            IMAGE_CACHE.pop(next(iter(IMAGE_CACHE)))
 
-    if not is_followup and quiz_hash and confidence == "high":
-        QUIZ_CACHE[quiz_hash] = (time.time(), dict(result))
-        if len(QUIZ_CACHE) > 500:
-            QUIZ_CACHE.pop(next(iter(QUIZ_CACHE)))
-        _db_put(quiz_hash, dict(result))
+        if not is_followup and quiz_hash and confidence == "high":
+            QUIZ_CACHE[quiz_hash] = (time.time(), dict(result))
+            if len(QUIZ_CACHE) > 500:
+                QUIZ_CACHE.pop(next(iter(QUIZ_CACHE)))
+            _db_put(quiz_hash, dict(result))
 
     if not preserve_notes and result.get("detected_type") in ("MCQ", "DIRECT_VALUE", "CODE_FIX"):
         result["expanded_note"] = ""
