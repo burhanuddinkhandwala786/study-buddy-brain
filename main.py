@@ -19,7 +19,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="4.7.0")
+app = FastAPI(title="Cursor Companion Brain", version="4.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,7 +42,7 @@ _KEY_CYCLE = itertools.count()
 _GEMINI_CLIENTS = {}
 _GEMINI_CLIENTS_LOCK = threading.Lock()
 _DB_LOCK = threading.Lock()
-_DB_PATH = "/tmp/companion_brain_cache_v5.db"
+_DB_PATH = "/tmp/companion_brain_cache_v6.db"
 
 GEMINI_FAST_MODELS = [
     "gemini-3.5-flash-lite",
@@ -213,7 +213,7 @@ def normalize_quiz_hash(text: str) -> str:
     )
     words = re.findall(r"[a-z0-9]+", s.lower())
     cleaned = "".join(words)
-    return hashlib.md5(f"v5:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
+    return hashlib.md5(f"v6:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 45 and len(words) >= 6) else ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -235,7 +235,6 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                # 18000ms avoids Google's minimum deadline 400 INVALID_ARGUMENT error
                 client = genai.Client(api_key=api_key, http_options={"timeout": 18000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
@@ -247,7 +246,7 @@ def health():
     now = time.time()
     return {
         "status": "ok",
-        "engine": "v4.7-stable-all",
+        "engine": "v4.8-enterprise-strict-json",
         "gemini_keys": len(get_keys("GEMINI_API_KEY")),
         "groq_keys": len(get_keys("GROQ_API_KEY")),
         "nvidia_keys": len(get_keys("NVIDIA_API_KEY")),
@@ -289,9 +288,12 @@ def diagnose_keys():
         keys = get_keys(env_name)
         if keys:
             try:
+                body = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 32}
+                if tag == "groq" and "gpt-oss" in model:
+                    body["reasoning_effort"] = "low"
                 r = _HTTP_CLIENT.post(
                     url,
-                    json={"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 10},
+                    json=body,
                     headers={"Authorization": f"Bearer {keys[0]}", "Content-Type": "application/json"},
                 )
                 report[tag] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}: {r.text[:100]}"
@@ -349,20 +351,6 @@ def self_test():
     return results
 
 
-_THOUGHT_PREFIXES = (
-    "the user",
-    "let's",
-    "let us",
-    "okay",
-    "first,",
-    "we need",
-    "to solve",
-    "analyzing",
-    "step 1",
-    "thinking",
-)
-
-
 def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
     cleaned = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.S | re.I)
     cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.S | re.I)
@@ -408,29 +396,11 @@ def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
                 "pointer_xy": None,
             }
 
-    if not isinstance(data, dict):
-        lines = [
-            ln.strip().lstrip("*-•").strip()
-            for ln in cleaned.splitlines()
-            if ln.strip()
-            and not ln.strip().startswith(("{", "}", '"'))
-            and not ln.strip().lower().startswith(_THOUGHT_PREFIXES)
-        ]
-        if not lines:
-            raise ValueError("Monologue output without JSON")
-        first_line = lines[0][:80]
-        data = {
-            "detected_type": "DIRECT_VALUE",
-            "cursor_pill": first_line,
-            "copy_value": first_line,
-            "expanded_note": " ".join(lines[:3])[:240] if preserve_notes else "",
-            "pointer_xy": None,
-        }
+    # Strict gate: never fall back to raw prose lines ("I need to think about it...") — fail over instead
+    if not isinstance(data, dict) or not str(data.get("cursor_pill", "")).strip():
+        raise ValueError("Model returned prose/thinking instead of JSON")
 
-    pill_str = str(data.get("cursor_pill", "")).strip()
-    if not pill_str or pill_str.lower().startswith(_THOUGHT_PREFIXES):
-        raise ValueError("Invalid monologue cursor_pill")
-
+    pill_str = str(data["cursor_pill"]).strip()
     data.setdefault("detected_type", "DIRECT_VALUE")
     data["cursor_pill"] = pill_str
     data.setdefault("copy_value", "")
@@ -593,8 +563,10 @@ def call_openai_compat(
             "model": model_id,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 450,
+            "max_tokens": 800,
         }
+        if provider_tag == "groq" and "gpt-oss" in model_id:
+            payload_body["reasoning_effort"] = "low"
         if provider_tag == "groq" and not img_b64:
             payload_body["response_format"] = {"type": "json_object"}
 
@@ -614,8 +586,9 @@ def call_openai_compat(
                 last_error = f"{provider_tag} {model_id}: {str(parse_exc)[:60]}"
                 continue
 
-        if response.status_code == 400 and "response_format" in payload_body:
+        if response.status_code == 400 and ("response_format" in payload_body or "reasoning_effort" in payload_body):
             payload_body.pop("response_format", None)
+            payload_body.pop("reasoning_effort", None)
             try:
                 retry_res = _HTTP_CLIENT.post(endpoint, json=payload_body, headers=headers)
                 if retry_res.status_code == 200:
@@ -783,7 +756,6 @@ def _run_shared_cascade(
 ) -> str:
     errors = []
 
-    # 1. Primary: Shared Gemini Pool (highest accuracy for both MCQ text and screenshots)
     try:
         return call_gemini_keys(
             keys=get_keys("GEMINI_API_KEY"),
@@ -796,7 +768,6 @@ def _run_shared_cascade(
     except Exception as exc:
         errors.append(f"Gemini: {exc}")
 
-    # 2. Automatic Failover: Groq
     for g_key in get_keys("GROQ_API_KEY"):
         try:
             raw_json = call_openai_compat(
@@ -814,12 +785,10 @@ def _run_shared_cascade(
         except Exception as exc:
             errors.append(f"Groq: {exc}")
 
-    # 3. Failover: NVIDIA NIM
     raw_nv = _call_nvidia_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
     if raw_nv:
         return raw_nv
 
-    # 4. Failover: OpenRouter Free
     raw_or = _call_openrouter_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
     if raw_or:
         return raw_or
@@ -897,8 +866,7 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
             "key_source": "BYOK" if is_byok else "POOL",
         }
 
-    # 1. Exact payload dedup (10 min)
-    cache_key = hashlib.md5(f"v5:{raw_key}".encode()).hexdigest()
+    cache_key = hashlib.md5(f"v6:{raw_key}".encode()).hexdigest()
     image_hit = IMAGE_CACHE.get(cache_key)
     if not is_followup and image_hit and time.time() - image_hit[0] < CACHE_TTL:
         cached = dict(image_hit[1])
@@ -907,7 +875,6 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
         cached["key_source"] = "BYOK" if is_byok else "CACHE"
         return cached
 
-    # 2. Cross-user normalized quiz cache (RAM + SQLite)
     if not is_followup and quiz_hash:
         q_hit = QUIZ_CACHE.get(quiz_hash)
         if q_hit and (time.time() - q_hit[0] < QUIZ_CACHE_TTL):
@@ -926,7 +893,6 @@ def _unified_execute(req: AnalyzeRequest, action_mode: str = "solve", preserve_n
             cached["key_source"] = "BYOK" if is_byok else "CACHE"
             return cached
 
-    # 3. Execute strict BYOK (if user provided key) OR Shared 4-Provider Pool
     if is_byok:
         try:
             raw_json = _route_server_byok(
