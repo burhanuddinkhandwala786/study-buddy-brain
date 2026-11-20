@@ -22,13 +22,12 @@ import httpx
 from google import genai
 from google.genai import types
 
-# Decompression-bomb protection
+# Decompression-bomb and payload caps
 Image.MAX_IMAGE_PIXELS = 25_000_000
-
-MAX_IMAGE_B64_CHARS = 5_500_000
+MAX_IMAGE_B64_CHARS = 5_500_000  # ~4 MB decoded image cap
 MAX_TEXT_CHARS = 25_000
 
-app = FastAPI(title="Cursor Companion Brain", version="7.1.0")
+app = FastAPI(title="Cursor Companion Brain", version="7.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,15 +48,9 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-# Tight 7.5s per-call timeout with connection pooling prevents 28s cascade stalls
-_HTTP_CLIENT = httpx.Client(
-    timeout=httpx.Timeout(7.5, connect=3.5),
-    limits=httpx.Limits(max_connections=40, max_keepalive_connections=20),
-)
-_REDIS_CLIENT = httpx.Client(
-    timeout=httpx.Timeout(2.0, connect=1.5),
-    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-)
+# Fast HTTP clients prevent 20-30s provider stalls
+_HTTP_CLIENT = httpx.Client(timeout=8.5)
+_REDIS_CLIENT = httpx.Client(timeout=1.5)
 _HEDGE_POOL = ThreadPoolExecutor(max_workers=24)
 
 IMAGE_CACHE = {}
@@ -78,7 +71,7 @@ _DB_LOCK = threading.Lock()
 _DB_PATH = "/tmp/companion_brain_cache_v13.db"
 
 _DISCOVERED_MODELS = {}
-_DISCOVERY_TTL = 21600
+_DISCOVERY_TTL = 21600  # 6 hours
 
 _COMMUNITY_KEYS = {
     "groq": [],
@@ -89,11 +82,11 @@ _COMMUNITY_KEYS = {
 _PRO_DEVICES = set()
 _COMMUNITY_LOCK = threading.Lock()
 
-# --- Verified Fast Active Zero-Card Models (Nov 2026) ---
+# --- Verified Active Zero-Card Models (Nov 2026) ---
 GROQ_TEXT_MODELS = [
     "openai/gpt-oss-120b",
-    "qwen/qwen3.8-27b",
     "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
 ]
 GROQ_VISION_MODELS = [
     "qwen/qwen3.8-27b",
@@ -103,31 +96,36 @@ GEMINI_FAST_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
 ]
 GEMINI_DEEP_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
 ]
 
 CLOUDFLARE_TEXT_MODELS = [
-    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "@cf/google/gemma-4-26b-a4b-it",
     "@cf/qwen/qwen3.8-27b",
+    "@cf/openai/gpt-oss-120b",
+    "@cf/zai-org/glm-4.7-flash",
 ]
 CLOUDFLARE_VISION_MODELS = [
     "@cf/google/gemma-4-26b-a4b-it",
     "@cf/qwen/qwen3.8-27b",
+    "@cf/meta/llama-4-scout-17b-16e-instruct",
 ]
 
-# Fastest NVIDIA models first so failover never stalls on 1T-parameter queues
 NVIDIA_TEXT_MODELS = [
     "nvidia/nemotron-3.5-bolt-e4b",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "mistralai/mistral-large-4-1t-a52b",
 ]
 NVIDIA_VISION_MODELS = [
     "nvidia/nemotron-3.5-bolt-e4b",
     "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "mistralai/mistral-large-4-1t-a52b",
 ]
 
 OPENROUTER_TEXT_MODELS = [
@@ -136,10 +134,11 @@ OPENROUTER_TEXT_MODELS = [
 ]
 OPENROUTER_VISION_MODELS = [
     "openrouter/free",
+    "nvidia/nemotron-3.5-super-vl:free",
     "google/gemma-4-31b-it:free",
 ]
 
-# Optional paid BYOK-only providers
+# Optional BYOK-only providers (never required in shared free pool)
 CEREBRAS_TEXT_MODELS = ["gpt-oss-120b", "qwen-3.8-27b"]
 CEREBRAS_VISION_MODELS = ["qwen-3.8-27b"]
 MISTRAL_TEXT_MODELS = ["mistral-small-latest"]
@@ -226,7 +225,7 @@ Output ONLY a single raw JSON object:
 Rules: cursor_pill = 1-line takeaway (max 70 chars); copy_value = same takeaway; expanded_note = 3 short bullet points."""
 
 
-# --- Authenticated Encryption at Rest (Stdlib Encrypt-then-MAC) ---
+# --- Authenticated Encryption at Rest (Stdlib Encrypt-then-MAC, Zero Extra Deps) ---
 def _get_master_key() -> bytes:
     seed = (
         os.environ.get("APP_ENCRYPTION_SECRET", "").strip()
@@ -299,7 +298,7 @@ def _get_client_ip_hash(request: Optional[Request]) -> str:
     return hashlib.sha256(_get_master_key() + ip.encode("utf-8")).hexdigest()[:20]
 
 
-# --- Upstash Redis REST Store (with single-round-trip /pipeline) ---
+# --- Persistent Upstash Redis REST Store (Single-RTT Pipeline) ---
 def _redis_cfg():
     url = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
     token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
@@ -334,7 +333,9 @@ def _redis_pipeline(commands: list):
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         )
         if res.status_code == 200:
-            return [item.get("result") for item in res.json()]
+            body = res.json()
+            if isinstance(body, list):
+                return [item.get("result") if isinstance(item, dict) else None for item in body]
     except Exception:
         pass
     return None
@@ -388,7 +389,7 @@ _init_db()
 def _db_get(qhash: str, max_age: int = 86400) -> Optional[dict]:
     if not qhash:
         return None
-    raw_r = _redis_cmd("GET", f"cc:q13:{qhash}")
+    raw_r = _redis_cmd("GET", f"cc:q:{qhash}")
     if isinstance(raw_r, str) and raw_r:
         try:
             return json.loads(raw_r)
@@ -410,7 +411,7 @@ def _db_put(qhash: str, payload: dict):
     if not qhash:
         return
     serialized = json.dumps(payload)
-    _redis_cmd("SET", f"cc:q13:{qhash}", serialized, "EX", 86400)
+    _redis_cmd("SET", f"cc:q:{qhash}", serialized, "EX", 86400)
     try:
         with _DB_LOCK:
             conn = sqlite3.connect(_DB_PATH)
@@ -457,62 +458,68 @@ def _persist_community_pool(provider: str, api_key: str, device_id: str):
     _redis_cmd("SET", "cc:v2:community_pool", json.dumps(encrypted_snapshot))
 
 
-def _check_all_limits(device_id: Optional[str], ip_hash: str, is_pro: bool) -> str:
-    """Single-round-trip Redis pipeline check for burst + daily device + daily IP limits.
-    Returns 'ok', 'burst', or 'daily'.
-    """
+def _check_all_limits_pipelined(device_id: Optional[str], ip_hash: str, is_pro: bool) -> str:
+    """Checks burst (10/min), daily device cap (10 Free / 150 Pro), and daily IP cap in 1 Redis RTT."""
     ident = device_id or ip_hash
+    if not ident:
+        return "ok"
+
     try:
-        max_rpm = int(os.environ.get("BURST_RPM_LIMIT", "12"))
+        max_rpm = int(os.environ.get("BURST_RPM_LIMIT", "10"))
         dev_limit = int(os.environ.get("DAILY_PRO_LIMIT", "150") if is_pro else os.environ.get("DAILY_FREE_LIMIT", "10"))
         ip_limit = int(os.environ.get("DAILY_IP_LIMIT", "120"))
     except ValueError:
-        max_rpm, dev_limit, ip_limit = 12, (150 if is_pro else 10), 120
+        max_rpm, dev_limit, ip_limit = 10, (150 if is_pro else 10), 120
 
     if _redis_cfg()[0]:
         minute_bucket = int(time.time() // 60)
         day = time.strftime("%Y%m%d", time.gmtime())
         cmds = []
-        burst_idx = dev_idx = ip_idx = -1
+        slots = {}
 
-        if ident:
-            bk = f"cc:burst:{ident}:{minute_bucket}"
-            burst_idx = len(cmds)
-            cmds.append(["INCR", bk])
-            cmds.append(["EXPIRE", bk, 70])
+        burst_key = f"cc:burst:{ident}:{minute_bucket}"
+        slots["burst"] = len(cmds)
+        cmds.append(["INCR", burst_key])
+        cmds.append(["EXPIRE", burst_key, 70, "NX"])
+
         if device_id:
-            dk = f"cc:rl:{device_id}:{day}"
-            dev_idx = len(cmds)
-            cmds.append(["INCR", dk])
-            cmds.append(["EXPIRE", dk, 86400])
-        if ip_hash:
-            ik = f"cc:iprl:{ip_hash}:{day}"
-            ip_idx = len(cmds)
-            cmds.append(["INCR", ik])
-            cmds.append(["EXPIRE", ik, 86400])
+            dev_key = f"cc:rl:{device_id}:{day}"
+            slots["dev"] = len(cmds)
+            cmds.append(["INCR", dev_key])
+            cmds.append(["EXPIRE", dev_key, 86400, "NX"])
 
-        res = _redis_pipeline(cmds)
-        if res is not None:
-            if burst_idx >= 0 and isinstance(res[burst_idx], int) and res[burst_idx] > max_rpm:
+        if ip_hash:
+            ip_key = f"cc:iprl:{ip_hash}:{day}"
+            slots["ip"] = len(cmds)
+            cmds.append(["INCR", ip_key])
+            cmds.append(["EXPIRE", ip_key, 86400, "NX"])
+
+        results = _redis_pipeline(cmds)
+        if results:
+            b_cnt = results[slots["burst"]]
+            if isinstance(b_cnt, int) and b_cnt > max_rpm:
                 return "burst"
-            if dev_idx >= 0 and isinstance(res[dev_idx], int) and res[dev_idx] > dev_limit:
-                return "daily"
-            if ip_idx >= 0 and isinstance(res[ip_idx], int) and res[ip_idx] > ip_limit:
-                return "daily"
+            if "dev" in slots:
+                d_cnt = results[slots["dev"]]
+                if isinstance(d_cnt, int) and d_cnt > dev_limit:
+                    return "quota"
+            if "ip" in slots:
+                i_cnt = results[slots["ip"]]
+                if isinstance(i_cnt, int) and i_cnt > ip_limit:
+                    return "quota"
         return "ok"
 
-    # Local fallback burst limiter if Redis is unconfigured
-    if ident:
-        now = time.time()
-        with _LOCAL_BURST_LOCK:
-            timestamps = [t for t in _LOCAL_BURST.get(ident, []) if now - t < 60]
-            if len(timestamps) >= max_rpm:
-                _LOCAL_BURST[ident] = timestamps
-                return "burst"
-            timestamps.append(now)
+    # Fallback local memory burst protection if Redis is not configured
+    now = time.time()
+    with _LOCAL_BURST_LOCK:
+        timestamps = [t for t in _LOCAL_BURST.get(ident, []) if now - t < 60]
+        if len(timestamps) >= max_rpm:
             _LOCAL_BURST[ident] = timestamps
-            if len(_LOCAL_BURST) > 1000:
-                _LOCAL_BURST.pop(next(iter(_LOCAL_BURST)))
+            return "burst"
+        timestamps.append(now)
+        _LOCAL_BURST[ident] = timestamps
+        if len(_LOCAL_BURST) > 1000:
+            _LOCAL_BURST.pop(next(iter(_LOCAL_BURST)))
     return "ok"
 
 
@@ -546,7 +553,7 @@ def _get_cloudflare_cfg():
     match = re.search(r"(?<![0-9a-fA-F])([0-9a-fA-F]{32})(?![0-9a-fA-F])", raw_acc)
     if match:
         return (match.group(1), keys, "ok")
-    return ("", [], "INVALID_ACCOUNT_ID")
+    return ("", [], "INVALID_ACCOUNT_ID (must be raw 32-char hex Account ID from dash.cloudflare.com)")
 
 
 def parse_user_keys(raw_user_keys: Optional[str]):
@@ -585,7 +592,7 @@ def normalize_quiz_hash(text: str) -> str:
     )
     words = re.findall(r"[a-z0-9]+", s.lower())
     cleaned = "".join(words)
-    return hashlib.md5(f"v13:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 35 and len(words) >= 6) else ""
+    return hashlib.md5(f"v13:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 30 and len(words) >= 5) else ""
 
 
 class AnalyzeRequest(BaseModel):
@@ -613,11 +620,13 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                client = genai.Client(api_key=api_key, http_options={"timeout": 12000})
+                # 20s deadline satisfies Google's >=10s rule and avoids false X-Server-Timeout 504s
+                client = genai.Client(api_key=api_key, http_options={"timeout": 20000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
 
 
+# --- Full 5-Provider Self-Healing Live Model Auto-Discovery ---
 def _discover_live_models(provider_tag: str, api_key: str, want_vision: bool = False) -> list:
     meta = PROVIDER_META.get(provider_tag)
     if not meta:
@@ -635,7 +644,10 @@ def _discover_live_models(provider_tag: str, api_key: str, want_vision: bool = F
         if r.status_code != 200:
             return []
         items = r.json().get("data", [])
-        skip_words = ("whisper", "tts", "audio", "embed", "guard", "moderation", "ocr", "transcribe", "realtime", "image-gen", "rerank")
+        skip_words = (
+            "whisper", "tts", "audio", "embed", "guard", "moderation",
+            "ocr", "transcribe", "realtime", "image-gen", "rerank", "safeguard",
+        )
         found = []
         for item in items:
             mid = str(item.get("id", "")).strip()
@@ -645,15 +657,95 @@ def _discover_live_models(provider_tag: str, api_key: str, want_vision: bool = F
             if provider_tag == "openrouter" and not (low.endswith(":free") or low == "openrouter/free"):
                 continue
             if want_vision:
-                if any(v in low for v in ("vl", "vision", "qwen", "gemma-4", "bolt", "free")):
+                if any(v in low for v in ("vl", "vision", "qwen", "gemma-4", "mistral-large-4", "bolt", "free")):
                     found.append(mid)
             else:
                 found.append(mid)
         found = found[:4]
-        _DISCOVERED_MODELS[cache_id] = (time.time(), found)
+        if found:
+            _DISCOVERED_MODELS[cache_id] = (time.time(), found)
         return found
     except Exception:
         return []
+
+
+def _discover_gemini_models(api_key: str) -> list:
+    """Auto-fetches active Gemini Flash models if hardcoded slugs ever retire."""
+    cache_id = "gemini:live"
+    cached = _DISCOVERED_MODELS.get(cache_id)
+    if cached and (time.time() - cached[0]) < _DISCOVERY_TTL:
+        return cached[1]
+    try:
+        r = _HTTP_CLIENT.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}&pageSize=100"
+        )
+        if r.status_code != 200:
+            return []
+        found = []
+        for m in r.json().get("models", []):
+            name = str(m.get("name", "")).replace("models/", "").strip()
+            methods = m.get("supportedGenerationMethods", [])
+            low = name.lower()
+            if (
+                "generateContent" in methods
+                and "gemini" in low
+                and "flash" in low
+                and not any(x in low for x in ("embed", "image", "audio", "tts", "live", "exp", "tuning", "2.0", "1.5"))
+            ):
+                found.append(name)
+        found.sort(reverse=True)
+        found = found[:4]
+        if found:
+            _DISCOVERED_MODELS[cache_id] = (time.time(), found)
+        return found
+    except Exception:
+        return []
+
+
+def _discover_cloudflare_models(account_id: str, api_key: str, want_vision: bool = False) -> list:
+    """Auto-fetches active Cloudflare Workers AI models if a hardcoded slug retires (404/410)."""
+    cache_id = f"cloudflare:{'img' if want_vision else 'txt'}"
+    cached = _DISCOVERED_MODELS.get(cache_id)
+    if cached and (time.time() - cached[0]) < _DISCOVERY_TTL:
+        return cached[1]
+    try:
+        r = _HTTP_CLIENT.get(
+            f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search?task=Text%20Generation",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        if r.status_code != 200:
+            return []
+        found = []
+        for item in r.json().get("result", []):
+            mid = str(item.get("name", "")).strip()
+            low = mid.lower()
+            if not mid.startswith("@cf/"):
+                continue
+            if any(bad in low for bad in ("lora", "guard", "embed", "tiny")):
+                continue
+            if want_vision:
+                if any(v in low for v in ("gemma-4", "qwen3.8", "llama-4-scout", "vision", "vl")):
+                    found.append(mid)
+            else:
+                if any(k in low for k in ("gemma-4", "qwen3.8", "gpt-oss", "glm-4", "llama-4", "llama-3.3")):
+                    found.append(mid)
+        found = found[:4]
+        if found:
+            _DISCOVERED_MODELS[cache_id] = (time.time(), found)
+        return found
+    except Exception:
+        return []
+
+
+def _get_live_or_default(cache_id: str, default_list: list) -> list:
+    cached = _DISCOVERED_MODELS.get(cache_id)
+    if cached and (time.time() - cached[0]) < _DISCOVERY_TTL and cached[1]:
+        merged = list(cached[1])
+        for m in default_list:
+            if m not in merged:
+                merged.append(m)
+        return merged[:4]
+    return list(default_list)
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -666,7 +758,7 @@ def health():
         pro_count = len(_PRO_DEVICES)
     return {
         "status": "ok",
-        "engine": "v7.1.0-turbo",
+        "engine": "v7.2.0-selfheal",
         "groq_keys": len(get_pool_keys("groq")),
         "gemini_keys": len(get_pool_keys("gemini")),
         "cloudflare_keys": len(cf_keys) if cf_status == "ok" else 0,
@@ -692,13 +784,13 @@ def remote_client_config():
         ).strip(),
         "notice": os.environ.get("APP_NOTICE", "").strip(),
         "byok_models": {
-            "groq_text": GROQ_TEXT_MODELS,
-            "groq_vision": GROQ_VISION_MODELS,
-            "gemini": GEMINI_FAST_MODELS,
-            "nvidia_text": NVIDIA_TEXT_MODELS,
-            "nvidia_vision": NVIDIA_VISION_MODELS,
-            "openrouter_text": OPENROUTER_TEXT_MODELS,
-            "openrouter_vision": OPENROUTER_VISION_MODELS,
+            "groq_text": _get_live_or_default("groq:txt", GROQ_TEXT_MODELS),
+            "groq_vision": _get_live_or_default("groq:img", GROQ_VISION_MODELS),
+            "gemini": _get_live_or_default("gemini:live", GEMINI_FAST_MODELS),
+            "nvidia_text": _get_live_or_default("nvidia:txt", NVIDIA_TEXT_MODELS),
+            "nvidia_vision": _get_live_or_default("nvidia:img", NVIDIA_VISION_MODELS),
+            "openrouter_text": _get_live_or_default("openrouter:txt", OPENROUTER_TEXT_MODELS),
+            "openrouter_vision": _get_live_or_default("openrouter:img", OPENROUTER_VISION_MODELS),
             "cerebras_text": CEREBRAS_TEXT_MODELS,
             "cerebras_vision": CEREBRAS_VISION_MODELS,
             "mistral_text": MISTRAL_TEXT_MODELS,
@@ -723,7 +815,7 @@ def diagnose_keys(request: Request, secret: Optional[str] = Query(default=None))
         if not keys:
             continue
         meta = PROVIDER_META[tag]
-        model = meta["text"][0]
+        model = _get_live_or_default(f"{tag}:txt", meta["text"])[0]
         try:
             body = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 32}
             if tag == "groq" and "gpt-oss" in model:
@@ -739,11 +831,12 @@ def diagnose_keys(request: Request, secret: Optional[str] = Query(default=None))
 
     cf_acc, cf_keys, cf_status = _get_cloudflare_cfg()
     if cf_status == "ok":
+        cf_model = _get_live_or_default("cloudflare:txt", CLOUDFLARE_TEXT_MODELS)[0]
         try:
             r = _HTTP_CLIENT.post(
                 f"https://api.cloudflare.com/client/v4/accounts/{cf_acc}/ai/v1/chat/completions",
                 json={
-                    "model": CLOUDFLARE_TEXT_MODELS[0],
+                    "model": cf_model,
                     "messages": [{"role": "user", "content": "Reply OK"}],
                     "max_tokens": 24,
                 },
@@ -755,11 +848,12 @@ def diagnose_keys(request: Request, secret: Optional[str] = Query(default=None))
     elif cf_status != "not_configured":
         report["cloudflare"] = f"CONFIG_ERROR: {cf_status}"
 
+    gemini_diag_model = _get_live_or_default("gemini:live", GEMINI_FAST_MODELS)[0]
     for index, api_key in enumerate(get_pool_keys("gemini"), 1):
         try:
             client = _get_client(api_key)
             response = client.models.generate_content(
-                model="gemini-3.5-flash-lite",
+                model=gemini_diag_model,
                 contents="Reply OK",
                 config=types.GenerateContentConfig(max_output_tokens=20),
             )
@@ -792,6 +886,7 @@ def self_test(request: Request, secret: Optional[str] = Query(default=None)):
             results[f"{tag}_pipeline"] = {"status": "SKIPPED (not configured)"}
             continue
         meta = PROVIDER_META[tag]
+        t_p = time.time()
         try:
             raw = call_openai_compat(
                 endpoint=meta["chat_url"],
@@ -799,18 +894,31 @@ def self_test(request: Request, secret: Optional[str] = Query(default=None)):
                 models=meta["text"],
                 prompt_text=probe,
                 provider_tag=tag,
-                max_attempts=1,
+                max_models=2,
             )
-            results[f"{tag}_pipeline"] = {"status": "200 OK", "output": extract_json(raw).get("cursor_pill")}
+            results[f"{tag}_pipeline"] = {
+                "status": "200 OK",
+                "output": extract_json(raw).get("cursor_pill"),
+                "ms": round((time.time() - t_p) * 1000),
+            }
         except Exception as exc:
-            results[f"{tag}_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
+            results[f"{tag}_pipeline"] = {
+                "status": "FAIL",
+                "error": str(exc)[:120],
+                "ms": round((time.time() - t_p) * 1000),
+            }
 
     cf_acc, cf_keys, cf_status = _get_cloudflare_cfg()
     if cf_status == "ok":
+        t_p = time.time()
         try:
-            raw_cf = _call_cloudflare_pool(probe, max_attempts=1)
+            raw_cf = _call_cloudflare_pool(probe)
             results["cloudflare_pipeline"] = (
-                {"status": "200 OK", "output": extract_json(raw_cf).get("cursor_pill")}
+                {
+                    "status": "200 OK",
+                    "output": extract_json(raw_cf).get("cursor_pill"),
+                    "ms": round((time.time() - t_p) * 1000),
+                }
                 if raw_cf
                 else {"status": "FAIL", "error": "Cloudflare returned empty"}
             )
@@ -821,15 +929,24 @@ def self_test(request: Request, secret: Optional[str] = Query(default=None)):
 
     gemini_keys = get_pool_keys("gemini")
     if gemini_keys:
+        t_p = time.time()
         try:
             raw_gemini = call_gemini_keys(
                 keys=gemini_keys,
                 prompt_text='Return JSON: {"verification":"ok","detected_type":"DIRECT_VALUE","cursor_pill":"4","copy_value":"4","expanded_note":"","pointer_xy":null}',
                 is_byok=False,
             )
-            results["gemini_pipeline"] = {"status": "200 OK", "output": extract_json(raw_gemini).get("cursor_pill")}
+            results["gemini_pipeline"] = {
+                "status": "200 OK",
+                "output": extract_json(raw_gemini).get("cursor_pill"),
+                "ms": round((time.time() - t_p) * 1000),
+            }
         except Exception as exc:
-            results["gemini_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
+            results["gemini_pipeline"] = {
+                "status": "FAIL",
+                "error": str(exc)[:120],
+                "ms": round((time.time() - t_p) * 1000),
+            }
 
     byok_guard = _unified_execute(
         AnalyzeRequest(
@@ -860,7 +977,7 @@ def self_test(request: Request, secret: Optional[str] = Query(default=None)):
 @app.post("/v3_1/contribute-key")
 def contribute_community_key(req: ContributeKeyRequest, request: Request):
     ip_hash = _get_client_ip_hash(request)
-    if _check_all_limits(req.device_id, ip_hash, True) == "burst":
+    if _check_all_limits_pipelined(req.device_id, ip_hash, is_pro=True) == "burst":
         return {"ok": False, "message": "Too many attempts — wait 1 minute"}
 
     keys = parse_user_keys(req.api_key)
@@ -874,15 +991,17 @@ def contribute_community_key(req: ContributeKeyRequest, request: Request):
     try:
         if prov == "gemini":
             client = _get_client(clean_key)
+            check_model = _get_live_or_default("gemini:live", GEMINI_FAST_MODELS)[0]
             client.models.generate_content(
-                model="gemini-3.5-flash-lite",
+                model=check_model,
                 contents="Reply OK",
                 config=types.GenerateContentConfig(max_output_tokens=16),
             )
         else:
             meta = PROVIDER_META[prov]
-            body = {"model": meta["text"][0], "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 24}
-            if prov == "groq" and "gpt-oss" in meta["text"][0]:
+            check_model = _get_live_or_default(f"{prov}:txt", meta["text"])[0]
+            body = {"model": check_model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 24}
+            if prov == "groq" and "gpt-oss" in check_model:
                 body["reasoning_effort"] = "low"
             r = _HTTP_CLIENT.post(
                 meta["chat_url"],
@@ -991,7 +1110,7 @@ def _classify_gemini_error(error_text: str) -> str:
         or "api key not valid" in lowered
     ):
         return "forbidden"
-    if "404" in error_text or "not_found" in lowered or "decommission" in lowered:
+    if "404" in error_text or "not_found" in lowered or "decommission" in lowered or "retired" in lowered:
         return "model_unavailable"
     return "other"
 
@@ -1006,7 +1125,7 @@ def _try_one_gemini(
 ) -> str:
     cfg_kwargs = {
         "response_mime_type": "application/json",
-        "max_output_tokens": 800,
+        "max_output_tokens": 900,
     }
     if use_thinking:
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
@@ -1046,7 +1165,6 @@ def call_gemini_keys(
     deep: bool = False,
     is_byok: bool = False,
     sys_prompt: str = PROMPT,
-    deadline: Optional[float] = None,
 ) -> str:
     if not keys:
         raise RuntimeError("No Gemini keys configured")
@@ -1054,15 +1172,26 @@ def call_gemini_keys(
     now = time.time()
     start_idx = next(_KEY_CYCLE) % len(keys)
     ordered_keys = keys[start_idx:] + keys[:start_idx]
-    models = GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS
+
+    base_models = list(GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS)
+    cached_live = _DISCOVERED_MODELS.get("gemini:live")
+    if cached_live and (now - cached_live[0]) < _DISCOVERY_TTL:
+        for m in cached_live[1]:
+            if m not in base_models:
+                base_models.append(m)
+
     last_error = "Gemini keys cooling down"
     attempts = 0
     max_attempts = 4 if is_byok else 2
+    discovered_now = False
+    idx = 0
 
-    for model_name in models:
+    while idx < len(base_models):
+        model_name = base_models[idx]
+        idx += 1
         use_thinking = "lite" not in model_name
         for api_key in ordered_keys:
-            if attempts >= max_attempts or (deadline and time.time() >= deadline):
+            if attempts >= max_attempts:
                 break
             if KEY_COOLDOWN.get(api_key, 0) > now:
                 continue
@@ -1088,7 +1217,16 @@ def call_gemini_keys(
                     KEY_COOLDOWN[api_key] = time.time() + 3600
                 elif err_type == "model_unavailable":
                     KEY_COOLDOWN[model_cd_key] = time.time() + 21600
-        if attempts >= max_attempts or (deadline and time.time() >= deadline):
+                    if not discovered_now:
+                        discovered_now = True
+                        added = 0
+                        for live_m in _discover_gemini_models(api_key):
+                            if live_m not in base_models:
+                                base_models.append(live_m)
+                                added += 1
+                        if added:
+                            max_attempts += 1
+        if attempts >= max_attempts:
             break
 
     if is_byok and all(KEY_COOLDOWN.get(k, 0) > time.time() for k in keys):
@@ -1107,20 +1245,18 @@ def call_openai_compat(
     provider_tag: str = "compat",
     is_byok: bool = False,
     sys_prompt: str = PROMPT,
-    max_attempts: int = 2,
-    deadline: Optional[float] = None,
+    max_models: int = 2,
 ) -> str:
     last_error = f"No {provider_tag} attempt succeeded"
     modality = "img" if img_b64 else "txt"
     tried = set()
-    candidate_models = list(models)
+    candidate_models = _get_live_or_default(f"{provider_tag}:{modality}", models)
     discovered_added = False
     attempts = 0
+    attempt_cap = 6 if is_byok else max_models
 
     idx = 0
-    while idx < len(candidate_models) and attempts < max_attempts:
-        if deadline and time.time() >= deadline:
-            break
+    while idx < len(candidate_models) and attempts < attempt_cap:
         model_id = candidate_models[idx]
         idx += 1
         if model_id in tried:
@@ -1169,7 +1305,6 @@ def call_openai_compat(
             response = _HTTP_CLIENT.post(endpoint, json=payload_body, headers=headers)
         except Exception as exc:
             last_error = f"{provider_tag} {model_id}: {str(exc)[:80]}"
-            KEY_COOLDOWN[cooldown_key] = time.time() + 30
             continue
 
         if response.status_code == 200:
@@ -1202,12 +1337,22 @@ def call_openai_compat(
                 raise RuntimeError("BYOK_INVALID: Key invalid or credit exhausted (Alt+K)")
             break
         if response.status_code in (429, 503, 504):
+            if provider_tag == "openrouter" and "per-day" in response.text.lower():
+                KEY_COOLDOWN[f"{provider_tag}:{api_key}"] = time.time() + 21600
+                break
             KEY_COOLDOWN[cooldown_key] = time.time() + (45 if response.status_code >= 500 else 25)
         elif response.status_code in (400, 404, 410):
             KEY_COOLDOWN[cooldown_key] = time.time() + 21600
             if not discovered_added and idx >= len(candidate_models):
                 discovered_added = True
-                candidate_models.extend(_discover_live_models(provider_tag, api_key, want_vision=bool(img_b64)))
+                if provider_tag == "cloudflare":
+                    cf_acc, _, _ = _get_cloudflare_cfg()
+                    live_found = _discover_cloudflare_models(cf_acc, api_key, want_vision=bool(img_b64)) if cf_acc else []
+                else:
+                    live_found = _discover_live_models(provider_tag, api_key, want_vision=bool(img_b64))
+                if live_found:
+                    candidate_models.extend(live_found)
+                    attempt_cap += 1
 
     if is_byok:
         raise RuntimeError(f"BYOK_LIMIT: {last_error}")
@@ -1221,7 +1366,7 @@ def _route_server_byok(
     img_b64: Optional[str] = None,
     deep: bool = False,
     sys_prompt: str = PROMPT,
-) -> tuple:
+) -> str:
     grouped = {k: [] for k in ("groq", "gemini", "nvidia", "openrouter", "cerebras", "mistral", "openai")}
     for raw_k in user_keys:
         prov, clean_k = detect_key_provider(raw_k)
@@ -1237,7 +1382,7 @@ def _route_server_byok(
         meta = PROVIDER_META[prov]
         for api_key in grouped[prov]:
             try:
-                out = call_openai_compat(
+                return call_openai_compat(
                     endpoint=meta["chat_url"],
                     api_key=api_key,
                     models=meta["vision"] if img_b64 else meta["text"],
@@ -1246,24 +1391,21 @@ def _route_server_byok(
                     provider_tag=prov,
                     is_byok=True,
                     sys_prompt=sys_prompt,
-                    max_attempts=3,
                 )
-                return (out, prov)
             except Exception as exc:
                 errors.append(str(exc))
 
     if grouped["gemini"]:
         try:
-            out = call_gemini_keys(
+            return call_gemini_keys(
                 grouped["gemini"], prompt_text, img_pil=img_pil, deep=deep, is_byok=True, sys_prompt=sys_prompt
             )
-            return (out, "gemini")
         except Exception as exc:
             errors.append(str(exc))
 
     for oa_key in grouped["openai"]:
         try:
-            out = call_openai_compat(
+            return call_openai_compat(
                 endpoint="https://api.openai.com/v1/chat/completions",
                 api_key=oa_key,
                 models=["gpt-4o-mini"],
@@ -1272,9 +1414,7 @@ def _route_server_byok(
                 provider_tag="openai",
                 is_byok=True,
                 sys_prompt=sys_prompt,
-                max_attempts=1,
             )
-            return (out, "openai")
         except Exception as exc:
             errors.append(str(exc))
 
@@ -1288,8 +1428,7 @@ def _call_compat_pool(
     prompt_text: str,
     img_b64: Optional[str] = None,
     sys_prompt: str = PROMPT,
-    max_attempts: int = 1,
-    deadline: Optional[float] = None,
+    max_models: int = 2,
 ) -> Optional[str]:
     keys = get_pool_keys(provider_tag)
     if not keys:
@@ -1297,9 +1436,7 @@ def _call_compat_pool(
     meta = PROVIDER_META[provider_tag]
     start_idx = next(_KEY_CYCLE) % len(keys)
     ordered = keys[start_idx:] + keys[:start_idx]
-    for api_key in ordered:
-        if deadline and time.time() >= deadline:
-            break
+    for api_key in ordered[:2]:
         try:
             res = call_openai_compat(
                 endpoint=meta["chat_url"],
@@ -1310,8 +1447,7 @@ def _call_compat_pool(
                 provider_tag=provider_tag,
                 is_byok=False,
                 sys_prompt=sys_prompt,
-                max_attempts=max_attempts,
-                deadline=deadline,
+                max_models=max_models,
             )
             if res:
                 return res
@@ -1320,21 +1456,13 @@ def _call_compat_pool(
     return None
 
 
-def _call_cloudflare_pool(
-    prompt_text: str,
-    img_b64: Optional[str] = None,
-    sys_prompt: str = PROMPT,
-    max_attempts: int = 1,
-    deadline: Optional[float] = None,
-) -> Optional[str]:
+def _call_cloudflare_pool(prompt_text: str, img_b64: Optional[str] = None, sys_prompt: str = PROMPT) -> Optional[str]:
     account_id, keys, status = _get_cloudflare_cfg()
     if status != "ok" or not account_id or not keys:
         return None
     endpoint = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
     models = CLOUDFLARE_VISION_MODELS if img_b64 else CLOUDFLARE_TEXT_MODELS
-    for api_key in keys:
-        if deadline and time.time() >= deadline:
-            break
+    for api_key in keys[:2]:
         try:
             res = call_openai_compat(
                 endpoint=endpoint,
@@ -1345,8 +1473,7 @@ def _call_cloudflare_pool(
                 provider_tag="cloudflare",
                 is_byok=False,
                 sys_prompt=sys_prompt,
-                max_attempts=max_attempts,
-                deadline=deadline,
+                max_models=1,
             )
             if res:
                 return res
@@ -1357,7 +1484,7 @@ def _call_cloudflare_pool(
 
 def _has_ready_gemini(deep: bool = False) -> bool:
     now = time.time()
-    models = GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS
+    models = _get_live_or_default("gemini:live", GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS)
     for api_key in get_pool_keys("gemini"):
         if KEY_COOLDOWN.get(api_key, 0) > now:
             continue
@@ -1374,37 +1501,33 @@ def _run_shared_cascade(
     is_followup: bool,
     sys_prompt: str,
     hedged: bool = False,
-) -> tuple:
-    # Hard 13.5s cascade budget guarantees server NEVER hangs for 28s
-    deadline = time.time() + 13.5
+) -> str:
     errors = []
     groq_tried = False
     gemini_tried = False
     gemini_ready = _has_ready_gemini(deep=is_followup)
 
-    # Tier 1 (Fastest Pair): Groq lead <-> 1.5s staggered hedge to Gemini 3.5 Flash-Lite
+    # Tier 1 (Sub-2s Fast Hedge): Groq lead <-> 1.2s staggered hedge to Gemini
     if hedged and get_pool_keys("groq"):
         done_event = threading.Event()
         wake_backup = threading.Event()
 
         def _groq_lead():
             try:
-                res = _call_compat_pool(
-                    "groq", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_attempts=2, deadline=deadline
-                )
+                res = _call_compat_pool("groq", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_models=1)
                 if res:
                     done_event.set()
                     wake_backup.set()
-                    return (res, "groq")
+                    return res
                 wake_backup.set()
                 raise RuntimeError("Groq unavailable")
             except Exception:
                 wake_backup.set()
                 raise
 
-        def _gemini_hedge():
-            wake_backup.wait(1.5)
-            if done_event.is_set() or time.time() >= deadline:
+        def _gemini_backup():
+            wake_backup.wait(1.2)
+            if done_event.is_set():
                 raise RuntimeError("Cancelled")
             res = call_gemini_keys(
                 keys=get_pool_keys("gemini"),
@@ -1413,23 +1536,21 @@ def _run_shared_cascade(
                 deep=is_followup,
                 is_byok=False,
                 sys_prompt=sys_prompt,
-                deadline=deadline,
             )
             if res:
                 done_event.set()
-                return (res, "gemini")
-            raise RuntimeError("Gemini unavailable")
+            return res
 
         futures = [_HEDGE_POOL.submit(_groq_lead)]
         groq_tried = True
         if gemini_ready:
-            futures.append(_HEDGE_POOL.submit(_gemini_hedge))
+            futures.append(_HEDGE_POOL.submit(_gemini_backup))
             gemini_tried = True
 
         for fut in as_completed(futures):
             try:
                 out = fut.result()
-                if out and out[0]:
+                if out:
                     done_event.set()
                     wake_backup.set()
                     return out
@@ -1439,51 +1560,38 @@ def _run_shared_cascade(
         done_event.set()
         wake_backup.set()
 
-    # Remaining fast cascade (max 1 attempt per fallback provider so latency stays tight)
-    if not groq_tried and time.time() < deadline:
-        raw_groq = _call_compat_pool(
-            "groq", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_attempts=2, deadline=deadline
-        )
+    # Ordered 5-Provider Zero-Card Fallbacks (capped to 1 model per fallback so latency never snowballs)
+    if not groq_tried:
+        raw_groq = _call_compat_pool("groq", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_models=2)
         if raw_groq:
-            return (raw_groq, "groq")
+            return raw_groq
 
-    if not gemini_tried and gemini_ready and time.time() < deadline:
+    if not gemini_tried and gemini_ready:
         try:
-            raw_gem = call_gemini_keys(
+            return call_gemini_keys(
                 keys=get_pool_keys("gemini"),
                 prompt_text=contents_text,
                 img_pil=img_pil,
                 deep=is_followup,
                 is_byok=False,
                 sys_prompt=sys_prompt,
-                deadline=deadline,
             )
-            return (raw_gem, "gemini")
         except Exception as exc:
             errors.append(f"Gemini: {exc}")
 
-    if time.time() < deadline:
-        raw_cf = _call_cloudflare_pool(
-            contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_attempts=1, deadline=deadline
-        )
-        if raw_cf:
-            return (raw_cf, "cloudflare")
+    raw_cf = _call_cloudflare_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+    if raw_cf:
+        return raw_cf
 
-    if time.time() < deadline:
-        raw_nv = _call_compat_pool(
-            "nvidia", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_attempts=1, deadline=deadline
-        )
-        if raw_nv:
-            return (raw_nv, "nvidia")
+    raw_nv = _call_compat_pool("nvidia", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_models=1)
+    if raw_nv:
+        return raw_nv
 
-    if time.time() < deadline:
-        raw_or = _call_compat_pool(
-            "openrouter", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_attempts=1, deadline=deadline
-        )
-        if raw_or:
-            return (raw_or, "openrouter")
+    raw_or = _call_compat_pool("openrouter", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_models=1)
+    if raw_or:
+        return raw_or
 
-    raise RuntimeError(" | ".join(errors) or "All providers busy")
+    raise RuntimeError(" | ".join(errors) or "All 5 providers temporarily busy")
 
 
 def _unified_execute(
@@ -1496,8 +1604,6 @@ def _unified_execute(
     device_id: Optional[str] = None,
     ip_hash: str = "",
 ) -> dict:
-    t0 = time.time()
-
     if req.image_base64 and len(req.image_base64) > MAX_IMAGE_B64_CHARS:
         return {
             "detected_type": "ERROR",
@@ -1535,7 +1641,6 @@ def _unified_execute(
             "expanded_note": "Zero-token test mode active — 0 API credits spent.",
             "pointer_xy": None,
             "key_source": "TEST",
-            "server_ms": round((time.time() - t0) * 1000),
         }
 
     contents_text = ""
@@ -1551,17 +1656,17 @@ def _unified_execute(
     elif req.image_base64:
         clean_b64 = req.image_base64.split(",")[-1]
         img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-        # Exact image hash only — NEVER perceptual dHash (prevents previous-question cache collisions)
+        # Exact MD5 only — never collides across different questions
         raw_key = f"{mode}:img:{hashlib.md5(clean_b64.encode()).hexdigest()}"
 
-        max_dim = 780 if high_res_vision else 680
+        max_dim = 780 if high_res_vision else 700
         img_pil.thumbnail((max_dim, max_dim), Image.LANCZOS)
 
         small_img = img_pil.copy()
         compat_dim = 760 if high_res_vision else 512
         small_img.thumbnail((compat_dim, compat_dim), Image.BILINEAR)
         buffer = BytesIO()
-        small_img.save(buffer, format="JPEG", quality=76 if high_res_vision else 68)
+        small_img.save(buffer, format="JPEG", quality=74 if high_res_vision else 68)
         img_b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
         contents_text = (
@@ -1595,7 +1700,6 @@ def _unified_execute(
             if not preserve_notes:
                 cached["expanded_note"] = ""
             cached["key_source"] = "BYOK" if is_byok else "CACHE"
-            cached["server_ms"] = round((time.time() - t0) * 1000)
             return cached
 
     if not is_followup and quiz_hash:
@@ -1605,7 +1709,6 @@ def _unified_execute(
             if not preserve_notes:
                 cached["expanded_note"] = ""
             cached["key_source"] = "BYOK" if is_byok else "CACHE"
-            cached["server_ms"] = round((time.time() - t0) * 1000)
             return cached
 
         db_hit = _db_get(quiz_hash)
@@ -1615,13 +1718,11 @@ def _unified_execute(
             if not preserve_notes:
                 cached["expanded_note"] = ""
             cached["key_source"] = "BYOK" if is_byok else "CACHE"
-            cached["server_ms"] = round((time.time() - t0) * 1000)
             return cached
 
-    provider_used = ""
     if is_byok:
         try:
-            raw_json, provider_used = _route_server_byok(
+            raw_json = _route_server_byok(
                 user_keys=user_keys,
                 prompt_text=contents_text,
                 img_pil=img_pil,
@@ -1649,27 +1750,27 @@ def _unified_execute(
                 "key_source": "BYOK",
             }
     else:
-        limit_state = _check_all_limits(device_id, ip_hash, is_pro_pool)
-        if limit_state == "burst":
+        limit_status = _check_all_limits_pipelined(device_id, ip_hash, is_pro_pool)
+        if limit_status == "burst":
             return {
                 "detected_type": "ERROR",
                 "cursor_pill": "Slow down — wait a few seconds",
                 "copy_value": "",
-                "expanded_note": "Burst protection active. Add your own free key in Alt+K for unlimited speed.",
+                "expanded_note": "Burst protection active (10 req/min). Add your own free key in Alt+K for unlimited speed.",
                 "pointer_xy": None,
                 "key_source": "POOL",
             }
-        if limit_state == "daily":
+        if limit_status == "quota":
             return {
                 "detected_type": "ERROR",
                 "cursor_pill": "Daily free limit reached — add free key in Alt+K",
                 "copy_value": "",
-                "expanded_note": "Paste your own free Groq/Gemini key in Alt+K (unlimited), or share:<KEY> for Pro Pool.",
+                "expanded_note": "Paste your own free Groq/Gemini key in Alt+K, or type share:<KEY> to unlock 150/day Pro Pool.",
                 "pointer_xy": None,
                 "key_source": "POOL",
             }
 
-        raw_json, provider_used = _run_shared_cascade(
+        raw_json = _run_shared_cascade(
             contents_text=contents_text,
             img_pil=img_pil,
             img_b64_str=img_b64_str,
@@ -1681,8 +1782,6 @@ def _unified_execute(
     result = extract_json(raw_json, preserve_notes=True)
     confidence = result.pop("confidence", "high")
     result["key_source"] = "BYOK" if is_byok else ("PRO" if is_pro_pool else "POOL")
-    result["provider_used"] = provider_used
-    result["server_ms"] = round((time.time() - t0) * 1000)
 
     if not re.search(r"unclear crop", result.get("cursor_pill", ""), re.I):
         IMAGE_CACHE[cache_key] = (time.time(), dict(result))
@@ -1693,7 +1792,6 @@ def _unified_execute(
             QUIZ_CACHE[quiz_hash] = (time.time(), dict(result))
             if len(QUIZ_CACHE) > 900:
                 QUIZ_CACHE.pop(next(iter(QUIZ_CACHE)))
-            # Non-blocking background persistence (0ms latency impact)
             _HEDGE_POOL.submit(_db_put, quiz_hash, dict(result))
 
     if not preserve_notes and result.get("detected_type") in ("MCQ", "DIRECT_VALUE", "CODE_FIX"):
