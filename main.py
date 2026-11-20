@@ -1,10 +1,12 @@
 import os
 import re
 import json
+import hmac
 import base64
 import time
 import sqlite3
 import hashlib
+import secrets
 import itertools
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,7 +14,7 @@ from io import BytesIO
 from typing import Optional
 
 from PIL import Image
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -20,18 +22,36 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="6.1.0")
+# Decompression-bomb protection
+Image.MAX_IMAGE_PIXELS = 25_000_000
+
+MAX_IMAGE_B64_CHARS = 5_500_000  # ~4 MB decoded image cap
+MAX_TEXT_CHARS = 25_000
+
+app = FastAPI(title="Cursor Companion Brain", version="7.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Device-ID", "X-Admin-Secret"],
 )
 
-_HTTP_CLIENT = httpx.Client(timeout=12.0)
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
+
+_HTTP_CLIENT = httpx.Client(timeout=13.0)
 _REDIS_CLIENT = httpx.Client(timeout=2.5)
-_HEDGE_POOL = ThreadPoolExecutor(max_workers=20)
+_HEDGE_POOL = ThreadPoolExecutor(max_workers=24)
 
 IMAGE_CACHE = {}
 CACHE_TTL = 1800
@@ -42,27 +62,27 @@ QUIZ_CACHE_TTL = 7200
 KEY_COOLDOWN = {}
 _KEY_CYCLE = itertools.count()
 
+_LOCAL_BURST = {}
+_LOCAL_BURST_LOCK = threading.Lock()
+
 _GEMINI_CLIENTS = {}
 _GEMINI_CLIENTS_LOCK = threading.Lock()
 _DB_LOCK = threading.Lock()
-_DB_PATH = "/tmp/companion_brain_cache_v11.db"
+_DB_PATH = "/tmp/companion_brain_cache_v12.db"
 
 _DISCOVERED_MODELS = {}
 _DISCOVERY_TTL = 21600  # 6 hours
 
 _COMMUNITY_KEYS = {
     "groq": [],
-    "gemini": [],
-    "mistral": [],
-    "openrouter": [],
-    "cerebras": [],
     "nvidia": [],
+    "gemini": [],
+    "openrouter": [],
 }
 _PRO_DEVICES = set()
 _COMMUNITY_LOCK = threading.Lock()
 
-# --- Verified Active Models (Nov 2026) ---
-# Tier 1: Permanent Recurring Daily Free Tiers
+# --- Verified Active Zero-Card Models (Nov 2026) ---
 GROQ_TEXT_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
@@ -72,60 +92,55 @@ GROQ_VISION_MODELS = [
     "qwen/qwen3.8-27b",
 ]
 
+NVIDIA_TEXT_MODELS = [
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "nvidia/nemotron-3.5-bolt-e4b",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "mistralai/mistral-large-4-1t-a52b",
+]
+NVIDIA_VISION_MODELS = [
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "mistralai/mistral-large-4-1t-a52b",
+    "nvidia/nemotron-3.5-bolt-e4b",
+]
+
+CLOUDFLARE_TEXT_MODELS = [
+    "@cf/google/gemma-4-26b-a4b-it",
+    "@cf/qwen/qwen3.8-27b",
+    "@cf/zai-org/glm-4.7-flash",
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+]
+CLOUDFLARE_VISION_MODELS = [
+    "@cf/google/gemma-4-26b-a4b-it",
+    "@cf/qwen/qwen3.8-27b",
+]
+
 GEMINI_FAST_MODELS = [
-    "gemini-3.6-flash",
-    "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3.1-flash-lite",
 ]
 GEMINI_DEEP_MODELS = [
     "gemini-3.8-flash",
-    "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
 ]
 
-# Tier 2: Permanent Recurring Backups
-# Mistral Free Mode reliably serves mistral-small-latest (evergreen alias)
-MISTRAL_TEXT_MODELS = [
-    "mistral-small-latest",
-]
-MISTRAL_VISION_MODELS = [
-    "mistral-small-latest",
-]
-
-# Cloudflare Workers AI: 10,000 free Neurons/day permanently (resets 00:00 UTC)
-CLOUDFLARE_TEXT_MODELS = [
-    "@cf/google/gemma-4-26b-a4b-it",
-    "@cf/nvidia/nemotron-3-120b-a12b",
-    "@cf/zai-org/glm-4.7-flash",
-]
-
-# OpenRouter evergreen auto-routing safety net
 OPENROUTER_TEXT_MODELS = [
     "openrouter/free",
     "google/gemma-4-31b-it:free",
 ]
 OPENROUTER_VISION_MODELS = [
     "openrouter/free",
+    "nvidia/nemotron-3.5-super-vl:free",
     "google/gemma-4-31b-it:free",
 ]
 
-# Tier 3: Optional Finite/Trial Overflow (auto-quarantined 24h on HTTP 402)
-CEREBRAS_TEXT_MODELS = [
-    "gpt-oss-120b",
-    "qwen-3.8-27b",
-]
-CEREBRAS_VISION_MODELS = [
-    "qwen-3.8-27b",
-]
-
-NVIDIA_TEXT_MODELS = [
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
-    "nvidia/nemotron-3.5-bolt-e4b",
-    "mistralai/mistral-large-4-1t-a52b",
-]
-NVIDIA_VISION_MODELS = [
-    "mistralai/mistral-large-4-1t-a52b",
-]
+# Optional paid BYOK-only providers (never required in shared pool)
+CEREBRAS_TEXT_MODELS = ["gpt-oss-120b", "qwen-3.8-27b"]
+CEREBRAS_VISION_MODELS = ["qwen-3.8-27b"]
+MISTRAL_TEXT_MODELS = ["mistral-small-latest"]
+MISTRAL_VISION_MODELS = ["mistral-small-latest"]
 
 PROVIDER_META = {
     "groq": {
@@ -135,12 +150,12 @@ PROVIDER_META = {
         "text": GROQ_TEXT_MODELS,
         "vision": GROQ_VISION_MODELS,
     },
-    "mistral": {
-        "env": "MISTRAL_API_KEY",
-        "chat_url": "https://api.mistral.ai/v1/chat/completions",
-        "models_url": "https://api.mistral.ai/v1/models",
-        "text": MISTRAL_TEXT_MODELS,
-        "vision": MISTRAL_VISION_MODELS,
+    "nvidia": {
+        "env": "NVIDIA_API_KEY",
+        "chat_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "models_url": "https://integrate.api.nvidia.com/v1/models",
+        "text": NVIDIA_TEXT_MODELS,
+        "vision": NVIDIA_VISION_MODELS,
     },
     "openrouter": {
         "env": "OPENROUTER_API_KEY",
@@ -156,12 +171,12 @@ PROVIDER_META = {
         "text": CEREBRAS_TEXT_MODELS,
         "vision": CEREBRAS_VISION_MODELS,
     },
-    "nvidia": {
-        "env": "NVIDIA_API_KEY",
-        "chat_url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "models_url": "https://integrate.api.nvidia.com/v1/models",
-        "text": NVIDIA_TEXT_MODELS,
-        "vision": NVIDIA_VISION_MODELS,
+    "mistral": {
+        "env": "MISTRAL_API_KEY",
+        "chat_url": "https://api.mistral.ai/v1/chat/completions",
+        "models_url": "https://api.mistral.ai/v1/models",
+        "text": MISTRAL_TEXT_MODELS,
+        "vision": MISTRAL_VISION_MODELS,
     },
 }
 
@@ -208,7 +223,80 @@ Output ONLY a single raw JSON object:
 Rules: cursor_pill = 1-line takeaway (max 70 chars); copy_value = same takeaway; expanded_note = 3 short bullet points."""
 
 
-# --- Persistent Upstash Redis REST Store (zero extra pip deps) ---
+# --- Authenticated Encryption at Rest (Stdlib Encrypt-then-MAC, Zero Extra Deps) ---
+def _get_master_key() -> bytes:
+    seed = (
+        os.environ.get("APP_ENCRYPTION_SECRET", "").strip()
+        or os.environ.get("ADMIN_SECRET", "").strip()
+        or os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+        or "cursor-companion-default-v7-key-material"
+    )
+    return hashlib.sha256(seed.encode("utf-8")).digest()
+
+
+def _keystream(enc_key: bytes, nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out.extend(hashlib.sha256(enc_key + nonce + counter.to_bytes(4, "big")).digest())
+        counter += 1
+    return bytes(out[:length])
+
+
+def _encrypt_secret(plaintext: str) -> str:
+    master = _get_master_key()
+    enc_k = hashlib.sha256(master + b":enc").digest()
+    mac_k = hashlib.sha256(master + b":mac").digest()
+    nonce = secrets.token_bytes(16)
+    pt = plaintext.encode("utf-8")
+    ks = _keystream(enc_k, nonce, len(pt))
+    ct = bytes(a ^ b for a, b in zip(pt, ks))
+    tag = hmac.new(mac_k, nonce + ct, hashlib.sha256).digest()
+    return "enc:v1:" + base64.urlsafe_b64encode(nonce + tag + ct).decode("ascii")
+
+
+def _decrypt_secret(blob: str) -> str:
+    if not isinstance(blob, str) or not blob:
+        return ""
+    if not blob.startswith("enc:v1:"):
+        return blob
+    try:
+        raw = base64.urlsafe_b64decode(blob[7:].encode("ascii"))
+        if len(raw) < 49:
+            return ""
+        nonce, tag, ct = raw[:16], raw[16:48], raw[48:]
+        master = _get_master_key()
+        enc_k = hashlib.sha256(master + b":enc").digest()
+        mac_k = hashlib.sha256(master + b":mac").digest()
+        expected = hmac.new(mac_k, nonce + ct, hashlib.sha256).digest()
+        if not hmac.compare_digest(tag, expected):
+            return ""
+        ks = _keystream(enc_k, nonce, len(ct))
+        return bytes(a ^ b for a, b in zip(ct, ks)).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _require_admin(request: Request, secret: Optional[str] = None):
+    expected = os.environ.get("ADMIN_SECRET", "").strip()
+    if not expected:
+        return
+    provided = (request.headers.get("X-Admin-Secret") or secret or "").strip()
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=403, detail="Admin secret required")
+
+
+def _get_client_ip_hash(request: Optional[Request]) -> str:
+    if not request:
+        return ""
+    xff = request.headers.get("X-Forwarded-For", "")
+    ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "")
+    if not ip:
+        return ""
+    return hashlib.sha256(_get_master_key() + ip.encode("utf-8")).hexdigest()[:20]
+
+
+# --- Persistent Upstash Redis REST Store ---
 def _redis_cfg():
     url = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
     token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
@@ -237,35 +325,41 @@ def _init_db():
         with _DB_LOCK:
             conn = sqlite3.connect(_DB_PATH)
             conn.execute("CREATE TABLE IF NOT EXISTS qcache (qhash TEXT PRIMARY KEY, ts REAL, payload TEXT)")
-            conn.execute("CREATE TABLE IF NOT EXISTS community_keys (provider TEXT, api_key TEXT PRIMARY KEY, device_id TEXT, ts REAL)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS community_keys_v2 "
+                "(key_hash TEXT PRIMARY KEY, provider TEXT, api_key_enc TEXT, device_id TEXT, ts REAL)"
+            )
             conn.execute("CREATE TABLE IF NOT EXISTS pro_devices (device_id TEXT PRIMARY KEY, ts REAL)")
-            rows = conn.execute("SELECT provider, api_key FROM community_keys").fetchall()
+            rows = conn.execute("SELECT provider, api_key_enc FROM community_keys_v2").fetchall()
             pro_rows = conn.execute("SELECT device_id FROM pro_devices").fetchall()
             conn.commit()
             conn.close()
         with _COMMUNITY_LOCK:
-            for prov, key in rows:
-                if prov in _COMMUNITY_KEYS and key not in _COMMUNITY_KEYS[prov]:
-                    _COMMUNITY_KEYS[prov].append(key)
+            for prov, enc_key in rows:
+                plain_k = _decrypt_secret(enc_key)
+                if plain_k and prov in _COMMUNITY_KEYS and plain_k not in _COMMUNITY_KEYS[prov]:
+                    _COMMUNITY_KEYS[prov].append(plain_k)
             for (dev,) in pro_rows:
                 _PRO_DEVICES.add(dev)
     except Exception:
         pass
 
-    raw_pool = _redis_cmd("GET", "cc:v1:community_pool")
-    if isinstance(raw_pool, str) and raw_pool:
-        try:
-            saved = json.loads(raw_pool)
-            with _COMMUNITY_LOCK:
-                for prov, key_list in saved.get("keys", {}).items():
-                    if prov in _COMMUNITY_KEYS and isinstance(key_list, list):
-                        for k in key_list:
-                            if k not in _COMMUNITY_KEYS[prov]:
-                                _COMMUNITY_KEYS[prov].append(k)
-                for dev in saved.get("pro_devices", []):
-                    _PRO_DEVICES.add(dev)
-        except Exception:
-            pass
+    for redis_key in ("cc:v2:community_pool", "cc:v1:community_pool"):
+        raw_pool = _redis_cmd("GET", redis_key)
+        if isinstance(raw_pool, str) and raw_pool:
+            try:
+                saved = json.loads(raw_pool)
+                with _COMMUNITY_LOCK:
+                    for prov, key_list in saved.get("keys", {}).items():
+                        if prov in _COMMUNITY_KEYS and isinstance(key_list, list):
+                            for blob in key_list:
+                                plain_k = _decrypt_secret(blob)
+                                if plain_k and plain_k not in _COMMUNITY_KEYS[prov]:
+                                    _COMMUNITY_KEYS[prov].append(plain_k)
+                    for dev in saved.get("pro_devices", []):
+                        _PRO_DEVICES.add(dev)
+            except Exception:
+                pass
 
 
 _init_db()
@@ -312,21 +406,24 @@ def _db_put(qhash: str, payload: dict):
 
 
 def _persist_community_pool(provider: str, api_key: str, device_id: str):
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    enc_val = _encrypt_secret(api_key)
     with _COMMUNITY_LOCK:
         if provider in _COMMUNITY_KEYS and api_key not in _COMMUNITY_KEYS[provider]:
             _COMMUNITY_KEYS[provider].append(api_key)
         if device_id:
             _PRO_DEVICES.add(device_id)
-        snapshot = {
-            "keys": {k: list(v) for k, v in _COMMUNITY_KEYS.items()},
+        encrypted_snapshot = {
+            "keys": {k: [_encrypt_secret(val) for val in v] for k, v in _COMMUNITY_KEYS.items()},
             "pro_devices": list(_PRO_DEVICES),
         }
     try:
         with _DB_LOCK:
             conn = sqlite3.connect(_DB_PATH)
             conn.execute(
-                "INSERT OR REPLACE INTO community_keys (provider, api_key, device_id, ts) VALUES (?, ?, ?, ?)",
-                (provider, api_key, device_id or "", time.time()),
+                "INSERT OR REPLACE INTO community_keys_v2 (key_hash, provider, api_key_enc, device_id, ts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (key_hash, provider, enc_val, device_id or "", time.time()),
             )
             if device_id:
                 conn.execute(
@@ -337,23 +434,71 @@ def _persist_community_pool(provider: str, api_key: str, device_id: str):
             conn.close()
     except Exception:
         pass
-    _redis_cmd("SET", "cc:v1:community_pool", json.dumps(snapshot))
+    _redis_cmd("SET", "cc:v2:community_pool", json.dumps(encrypted_snapshot))
 
 
-def _check_pool_quota(device_id: Optional[str], is_pro: bool) -> bool:
-    """Per-device daily shared-pool cap via Upstash Redis (cache hits stay free & unlimited)."""
-    if not device_id or not _redis_cfg()[0]:
+def _check_burst_limit(ip_hash: str, device_id: Optional[str]) -> bool:
+    """Blocks automated flooding (max 10 live requests/minute per device or IP)."""
+    ident = device_id or ip_hash
+    if not ident:
         return True
     try:
-        limit = int(os.environ.get("DAILY_PRO_LIMIT", "200") if is_pro else os.environ.get("DAILY_FREE_LIMIT", "35"))
+        max_rpm = int(os.environ.get("BURST_RPM_LIMIT", "10"))
     except ValueError:
-        limit = 200 if is_pro else 35
+        max_rpm = 10
+
+    if _redis_cfg()[0]:
+        minute_bucket = int(time.time() // 60)
+        rk = f"cc:burst:{ident}:{minute_bucket}"
+        cnt = _redis_cmd("INCR", rk)
+        if cnt == 1:
+            _redis_cmd("EXPIRE", rk, 70)
+        if isinstance(cnt, int) and cnt > max_rpm:
+            return False
+        return True
+
+    now = time.time()
+    with _LOCAL_BURST_LOCK:
+        timestamps = [t for t in _LOCAL_BURST.get(ident, []) if now - t < 60]
+        if len(timestamps) >= max_rpm:
+            _LOCAL_BURST[ident] = timestamps
+            return False
+        timestamps.append(now)
+        _LOCAL_BURST[ident] = timestamps
+        if len(_LOCAL_BURST) > 1000:
+            _LOCAL_BURST.pop(next(iter(_LOCAL_BURST)))
+    return True
+
+
+def _check_pool_quota(device_id: Optional[str], ip_hash: str, is_pro: bool) -> bool:
+    """Per-device daily cap (35 Free / 200 Pro) + campus-Wi-Fi-safe IP ceiling (250/day)."""
+    if not _redis_cfg()[0]:
+        return True
     day = time.strftime("%Y%m%d", time.gmtime())
-    rk = f"cc:rl:{device_id}:{day}"
-    count = _redis_cmd("INCR", rk)
-    if count == 1:
-        _redis_cmd("EXPIRE", rk, 86400)
-    return not (isinstance(count, int) and count > limit)
+    try:
+        dev_limit = int(os.environ.get("DAILY_PRO_LIMIT", "200") if is_pro else os.environ.get("DAILY_FREE_LIMIT", "35"))
+        ip_limit = int(os.environ.get("DAILY_IP_LIMIT", "250"))
+    except ValueError:
+        dev_limit = 200 if is_pro else 35
+        ip_limit = 250
+
+    if device_id:
+        rk = f"cc:rl:{device_id}:{day}"
+        count = _redis_cmd("INCR", rk)
+        if count == 1:
+            _redis_cmd("EXPIRE", rk, 86400)
+        if isinstance(count, int) and count > dev_limit:
+            return False
+
+    if ip_hash:
+        ipk = f"cc:iprl:{ip_hash}:{day}"
+        ip_cnt = _redis_cmd("INCR", ipk)
+        if ip_cnt == 1:
+            _redis_cmd("EXPIRE", ipk, 86400)
+        if isinstance(ip_cnt, int) and ip_cnt > ip_limit:
+            return False
+
+    return True
 
 
 def get_env_keys(env_name: str):
@@ -375,9 +520,19 @@ def get_pool_keys(provider: str):
 
 
 def _get_cloudflare_cfg():
-    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    raw_acc = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip().strip('"').strip("'")
     keys = get_env_keys("CLOUDFLARE_API_KEY")
-    return (account_id, keys) if (account_id and keys) else ("", [])
+    if not raw_acc and not keys:
+        return ("", [], "not_configured")
+    if not keys:
+        return ("", [], "MISSING_API_KEY")
+    if re.fullmatch(r"[0-9a-fA-F]{32}", raw_acc):
+        return (raw_acc, keys, "ok")
+    # Safely extract 32-char hex Account ID if a full Cloudflare dashboard URL was pasted
+    match = re.search(r"(?<![0-9a-fA-F])([0-9a-fA-F]{32})(?![0-9a-fA-F])", raw_acc)
+    if match:
+        return (match.group(1), keys, "ok")
+    return ("", [], "INVALID_ACCOUNT_ID (must be raw 32-char hex Account ID from dash.cloudflare.com)")
 
 
 def parse_user_keys(raw_user_keys: Optional[str]):
@@ -416,7 +571,7 @@ def normalize_quiz_hash(text: str) -> str:
     )
     words = re.findall(r"[a-z0-9]+", s.lower())
     cleaned = "".join(words)
-    return hashlib.md5(f"v11:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 30 and len(words) >= 5) else ""
+    return hashlib.md5(f"v12:{cleaned}".encode()).hexdigest() if (len(cleaned) >= 30 and len(words) >= 5) else ""
 
 
 def _image_dhash(img_pil: Image.Image) -> str:
@@ -455,7 +610,8 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                client = genai.Client(api_key=api_key, http_options={"timeout": 12000})
+                # 20s deadline avoids premature Google X-Server-Timeout 504s
+                client = genai.Client(api_key=api_key, http_options={"timeout": 20000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
 
@@ -477,7 +633,7 @@ def _discover_live_models(provider_tag: str, api_key: str, want_vision: bool = F
         if r.status_code != 200:
             return []
         items = r.json().get("data", [])
-        skip_words = ("whisper", "tts", "audio", "embed", "guard", "moderation", "ocr", "transcribe", "realtime", "image-gen")
+        skip_words = ("whisper", "tts", "audio", "embed", "guard", "moderation", "ocr", "transcribe", "realtime", "image-gen", "rerank")
         found = []
         for item in items:
             mid = str(item.get("id", "")).strip()
@@ -487,7 +643,7 @@ def _discover_live_models(provider_tag: str, api_key: str, want_vision: bool = F
             if provider_tag == "openrouter" and not (low.endswith(":free") or low == "openrouter/free"):
                 continue
             if want_vision:
-                if any(v in low for v in ("vl", "vision", "qwen", "gemma-4", "mistral-large-4", "mistral-small", "pixtral", "free")):
+                if any(v in low for v in ("vl", "vision", "qwen", "gemma-4", "mistral-large-4", "bolt", "free")):
                     found.append(mid)
             else:
                 found.append(mid)
@@ -502,23 +658,23 @@ def _discover_live_models(provider_tag: str, api_key: str, want_vision: bool = F
 @app.api_route("/healthz", methods=["GET", "HEAD"])
 def health():
     now = time.time()
-    _, cf_keys = _get_cloudflare_cfg()
+    cf_acc, cf_keys, cf_status = _get_cloudflare_cfg()
     with _COMMUNITY_LOCK:
         community_total = sum(len(v) for v in _COMMUNITY_KEYS.values())
         pro_count = len(_PRO_DEVICES)
     return {
         "status": "ok",
-        "engine": "v6.1.0-prod",
+        "engine": "v7.0.0-enterprise",
         "groq_keys": len(get_pool_keys("groq")),
-        "gemini_keys": len(get_pool_keys("gemini")),
-        "mistral_keys": len(get_pool_keys("mistral")),
-        "cloudflare_keys": len(cf_keys),
-        "openrouter_keys": len(get_pool_keys("openrouter")),
-        "cerebras_keys": len(get_pool_keys("cerebras")),
         "nvidia_keys": len(get_pool_keys("nvidia")),
+        "cloudflare_keys": len(cf_keys) if cf_status == "ok" else 0,
+        "cloudflare_status": cf_status,
+        "gemini_keys": len(get_pool_keys("gemini")),
+        "openrouter_keys": len(get_pool_keys("openrouter")),
         "community_keys": community_total,
         "pro_devices": pro_count,
         "persistent_cache": bool(_redis_cfg()[0]),
+        "admin_protected": bool(os.environ.get("ADMIN_SECRET", "").strip()),
         "cached_items": len(IMAGE_CACHE) + len(QUIZ_CACHE),
         "active_cooldowns": sum(1 for exp in KEY_COOLDOWN.values() if exp > now),
     }
@@ -536,36 +692,72 @@ def remote_client_config():
         "byok_models": {
             "groq_text": GROQ_TEXT_MODELS,
             "groq_vision": GROQ_VISION_MODELS,
+            "nvidia_text": NVIDIA_TEXT_MODELS,
+            "nvidia_vision": NVIDIA_VISION_MODELS,
             "gemini": GEMINI_FAST_MODELS,
-            "mistral_text": MISTRAL_TEXT_MODELS,
-            "mistral_vision": MISTRAL_VISION_MODELS,
             "openrouter_text": OPENROUTER_TEXT_MODELS,
             "openrouter_vision": OPENROUTER_VISION_MODELS,
             "cerebras_text": CEREBRAS_TEXT_MODELS,
             "cerebras_vision": CEREBRAS_VISION_MODELS,
-            "nvidia_text": NVIDIA_TEXT_MODELS,
-            "nvidia_vision": NVIDIA_VISION_MODELS,
+            "mistral_text": MISTRAL_TEXT_MODELS,
+            "mistral_vision": MISTRAL_VISION_MODELS,
         },
     }
 
 
 @app.get("/diag")
-def diagnose_keys():
+def diagnose_keys(request: Request, secret: Optional[str] = Query(default=None)):
+    _require_admin(request, secret)
     report = {
         "groq": "not_configured",
-        "gemini": [],
-        "mistral": "not_configured",
-        "cloudflare": "not_configured",
-        "openrouter": "not_configured",
-        "cerebras": "not_configured",
         "nvidia": "not_configured",
+        "cloudflare": "not_configured",
+        "gemini": [],
+        "openrouter": "not_configured",
     }
+
+    for tag in ("groq", "nvidia", "openrouter"):
+        keys = get_pool_keys(tag)
+        if not keys:
+            continue
+        meta = PROVIDER_META[tag]
+        model = meta["text"][0]
+        try:
+            body = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 32}
+            if tag == "groq" and "gpt-oss" in model:
+                body["reasoning_effort"] = "low"
+            r = _HTTP_CLIENT.post(
+                meta["chat_url"],
+                json=body,
+                headers={"Authorization": f"Bearer {keys[0]}", "Content-Type": "application/json"},
+            )
+            report[tag] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}: {r.text[:100]}"
+        except Exception as exc:
+            report[tag] = f"ERROR: {str(exc)[:100]}"
+
+    cf_acc, cf_keys, cf_status = _get_cloudflare_cfg()
+    if cf_status == "ok":
+        try:
+            r = _HTTP_CLIENT.post(
+                f"https://api.cloudflare.com/client/v4/accounts/{cf_acc}/ai/v1/chat/completions",
+                json={
+                    "model": CLOUDFLARE_TEXT_MODELS[0],
+                    "messages": [{"role": "user", "content": "Reply OK"}],
+                    "max_tokens": 24,
+                },
+                headers={"Authorization": f"Bearer {cf_keys[0]}", "Content-Type": "application/json"},
+            )
+            report["cloudflare"] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}: {r.text[:100]}"
+        except Exception as exc:
+            report["cloudflare"] = f"ERROR: {str(exc)[:100]}"
+    elif cf_status != "not_configured":
+        report["cloudflare"] = f"CONFIG_ERROR: {cf_status}"
 
     for index, api_key in enumerate(get_pool_keys("gemini"), 1):
         try:
             client = _get_client(api_key)
             response = client.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-3.5-flash-lite",
                 contents="Reply OK",
                 config=types.GenerateContentConfig(max_output_tokens=20),
             )
@@ -581,52 +773,18 @@ def diagnose_keys():
                 "reason": str(exc)[:120],
             })
 
-    for tag in ("groq", "mistral", "openrouter", "cerebras", "nvidia"):
-        keys = get_pool_keys(tag)
-        if not keys:
-            continue
-        meta = PROVIDER_META[tag]
-        model = meta["text"][0]
-        try:
-            body = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 32}
-            if tag in ("groq", "cerebras") and ("gpt-oss" in model or "qwen-3.8" in model):
-                body["reasoning_effort"] = "low"
-            r = _HTTP_CLIENT.post(
-                meta["chat_url"],
-                json=body,
-                headers={"Authorization": f"Bearer {keys[0]}", "Content-Type": "application/json"},
-            )
-            report[tag] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}: {r.text[:100]}"
-        except Exception as exc:
-            report[tag] = f"ERROR: {str(exc)[:100]}"
-
-    cf_acc, cf_keys = _get_cloudflare_cfg()
-    if cf_acc and cf_keys:
-        try:
-            r = _HTTP_CLIENT.post(
-                f"https://api.cloudflare.com/client/v4/accounts/{cf_acc}/ai/v1/chat/completions",
-                json={
-                    "model": CLOUDFLARE_TEXT_MODELS[0],
-                    "messages": [{"role": "user", "content": "Reply OK"}],
-                    "max_tokens": 24,
-                },
-                headers={"Authorization": f"Bearer {cf_keys[0]}", "Content-Type": "application/json"},
-            )
-            report["cloudflare"] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}: {r.text[:100]}"
-        except Exception as exc:
-            report["cloudflare"] = f"ERROR: {str(exc)[:100]}"
-
     return report
 
 
 @app.get("/selftest")
 @app.get("/v3/selftest")
-def self_test():
+def self_test(request: Request, secret: Optional[str] = Query(default=None)):
+    _require_admin(request, secret)
     results = {}
     t0 = time.time()
     probe = 'Return JSON: {"verification":"ok","detected_type":"DIRECT_VALUE","cursor_pill":"2","copy_value":"2","expanded_note":"","pointer_xy":null}'
 
-    for tag in ("groq", "mistral", "openrouter", "cerebras", "nvidia"):
+    for tag in ("groq", "nvidia", "openrouter"):
         keys = get_pool_keys(tag)
         if not keys:
             results[f"{tag}_pipeline"] = {"status": "SKIPPED (not configured)"}
@@ -644,8 +802,8 @@ def self_test():
         except Exception as exc:
             results[f"{tag}_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
 
-    cf_acc, cf_keys = _get_cloudflare_cfg()
-    if cf_acc and cf_keys:
+    cf_acc, cf_keys, cf_status = _get_cloudflare_cfg()
+    if cf_status == "ok":
         try:
             raw_cf = _call_cloudflare_pool(probe)
             results["cloudflare_pipeline"] = (
@@ -656,7 +814,7 @@ def self_test():
         except Exception as exc:
             results["cloudflare_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
     else:
-        results["cloudflare_pipeline"] = {"status": "SKIPPED (not configured)"}
+        results["cloudflare_pipeline"] = {"status": f"SKIPPED ({cf_status})"}
 
     gemini_keys = get_pool_keys("gemini")
     if gemini_keys:
@@ -670,18 +828,24 @@ def self_test():
         except Exception as exc:
             results["gemini_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
 
-    byok_guard = analyze_context(
+    byok_guard = _unified_execute(
         AnalyzeRequest(
             text_content="What is 2+2?",
             user_api_key="AIzaInvalidTestKey1, AIzaInvalidTestKey2",
-        )
+        ),
+        action_mode="solve",
+        preserve_notes=False,
     )
     results["byok_isolation_guard"] = {
         "status": "200 OK" if byok_guard.get("key_source") == "BYOK" else "FAIL",
         "message": byok_guard.get("cursor_pill"),
     }
 
-    mock_check = v3_analyze_context(V3AnalyzeRequest(text_content="TEST: UI alignment check"))
+    mock_check = _unified_execute(
+        V3AnalyzeRequest(text_content="TEST: UI alignment check"),
+        action_mode="solve",
+        preserve_notes=True,
+    )
     results["zero_token_test_mode"] = {
         "status": "200 OK (0 tokens)" if mock_check.get("key_source") == "TEST" else "FAIL",
         "pill": mock_check.get("cursor_pill"),
@@ -691,27 +855,31 @@ def self_test():
 
 
 @app.post("/v3_1/contribute-key")
-def contribute_community_key(req: ContributeKeyRequest):
+def contribute_community_key(req: ContributeKeyRequest, request: Request):
+    ip_hash = _get_client_ip_hash(request)
+    if not _check_burst_limit(ip_hash, req.device_id):
+        return {"ok": False, "message": "Too many attempts — wait 1 minute"}
+
     keys = parse_user_keys(req.api_key)
     if not keys:
         return {"ok": False, "message": "Invalid key format"}
 
     prov, clean_key = detect_key_provider(keys[0])
     if prov not in _COMMUNITY_KEYS:
-        return {"ok": False, "message": "Use a Groq (gsk_), Gemini (AIza), Mistral (mistral:), OpenRouter (sk-or-), Cerebras (csk-), or NVIDIA (nvapi-) key"}
+        return {"ok": False, "message": "Contribute a free Groq (gsk_), NVIDIA (nvapi-), Gemini (AIza), or OpenRouter (sk-or-) key"}
 
     try:
         if prov == "gemini":
             client = _get_client(clean_key)
             client.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-3.5-flash-lite",
                 contents="Reply OK",
                 config=types.GenerateContentConfig(max_output_tokens=16),
             )
         else:
             meta = PROVIDER_META[prov]
             body = {"model": meta["text"][0], "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 24}
-            if prov in ("groq", "cerebras") and ("gpt-oss" in meta["text"][0] or "qwen-3.8" in meta["text"][0]):
+            if prov == "groq" and "gpt-oss" in meta["text"][0]:
                 body["reasoning_effort"] = "low"
             r = _HTTP_CLIENT.post(
                 meta["chat_url"],
@@ -983,8 +1151,6 @@ def call_openai_compat(
         }
         if provider_tag == "groq" and "gpt-oss" in model_id:
             payload_body["reasoning_effort"] = "medium"
-        elif provider_tag == "cerebras" and ("gpt-oss" in model_id or "qwen-3.8" in model_id):
-            payload_body["reasoning_effort"] = "low"
         if provider_tag in ("groq", "cerebras", "mistral") and not img_b64:
             payload_body["response_format"] = {"type": "json_object"}
 
@@ -1018,7 +1184,6 @@ def call_openai_compat(
                 pass
 
         last_error = f"{provider_tag} {model_id}: HTTP {response.status_code}"
-        # Auto-quarantine expired trials (402) for 24h & auth failures (401/403) for 1h
         if response.status_code in (401, 402, 403):
             KEY_COOLDOWN[f"{provider_tag}:{api_key}"] = time.time() + (86400 if response.status_code == 402 else 3600)
             if is_byok:
@@ -1045,7 +1210,7 @@ def _route_server_byok(
     deep: bool = False,
     sys_prompt: str = PROMPT,
 ) -> str:
-    grouped = {k: [] for k in ("groq", "gemini", "mistral", "openrouter", "cerebras", "nvidia", "openai")}
+    grouped = {k: [] for k in ("groq", "nvidia", "gemini", "openrouter", "cerebras", "mistral", "openai")}
     for raw_k in user_keys:
         prov, clean_k = detect_key_provider(raw_k)
         if prov in grouped:
@@ -1056,7 +1221,7 @@ def _route_server_byok(
 
     errors = []
 
-    for prov in ("groq", "mistral", "openrouter", "cerebras", "nvidia"):
+    for prov in ("groq", "nvidia", "openrouter", "cerebras", "mistral"):
         meta = PROVIDER_META[prov]
         for api_key in grouped[prov]:
             try:
@@ -1127,19 +1292,20 @@ def _call_compat_pool(provider_tag: str, prompt_text: str, img_b64: Optional[str
     return None
 
 
-def _call_cloudflare_pool(prompt_text: str, sys_prompt: str = PROMPT) -> Optional[str]:
-    account_id, keys = _get_cloudflare_cfg()
-    if not account_id or not keys:
+def _call_cloudflare_pool(prompt_text: str, img_b64: Optional[str] = None, sys_prompt: str = PROMPT) -> Optional[str]:
+    account_id, keys, status = _get_cloudflare_cfg()
+    if status != "ok" or not account_id or not keys:
         return None
     endpoint = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
+    models = CLOUDFLARE_VISION_MODELS if img_b64 else CLOUDFLARE_TEXT_MODELS
     for api_key in keys:
         try:
             res = call_openai_compat(
                 endpoint=endpoint,
                 api_key=api_key,
-                models=CLOUDFLARE_TEXT_MODELS,
+                models=models,
                 prompt_text=prompt_text,
-                img_b64=None,
+                img_b64=img_b64,
                 provider_tag="cloudflare",
                 is_byok=False,
                 sys_prompt=sys_prompt,
@@ -1172,14 +1338,16 @@ def _run_shared_cascade(
     hedged: bool = False,
 ) -> str:
     errors = []
-    gemini_ready = _has_ready_gemini(deep=is_followup)
     groq_tried = False
-    gemini_tried = False
+    nvidia_tried = False
+    cf_tried = False
 
-    # Tier 1 (Permanent Recurring): Groq lead + staggered Gemini backup (1.8s)
+    # Tier 1: Groq lead <-> 1.6s staggered hedge to NVIDIA NIM (or Cloudflare if NVIDIA absent)
     if hedged and get_pool_keys("groq"):
         done_event = threading.Event()
         wake_backup = threading.Event()
+        use_nv_hedge = bool(get_pool_keys("nvidia"))
+        use_cf_hedge = (not use_nv_hedge) and (_get_cloudflare_cfg()[2] == "ok")
 
         def _groq_lead():
             try:
@@ -1194,29 +1362,28 @@ def _run_shared_cascade(
                 wake_backup.set()
                 raise
 
-        def _gemini_backup():
-            if not gemini_ready:
-                raise RuntimeError("Gemini cooling down")
-            wake_backup.wait(1.8)
+        def _hedge_backup():
+            wake_backup.wait(1.6)
             if done_event.is_set():
                 raise RuntimeError("Cancelled")
-            res = call_gemini_keys(
-                keys=get_pool_keys("gemini"),
-                prompt_text=contents_text,
-                img_pil=img_pil,
-                deep=is_followup,
-                is_byok=False,
-                sys_prompt=sys_prompt,
+            res = (
+                _call_compat_pool("nvidia", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+                if use_nv_hedge
+                else _call_cloudflare_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
             )
-            if res:
-                done_event.set()
+            if not res:
+                raise RuntimeError("Hedge backup unavailable")
+            done_event.set()
             return res
 
         futures = [_HEDGE_POOL.submit(_groq_lead)]
         groq_tried = True
-        if gemini_ready:
-            futures.append(_HEDGE_POOL.submit(_gemini_backup))
-            gemini_tried = True
+        if use_nv_hedge:
+            futures.append(_HEDGE_POOL.submit(_hedge_backup))
+            nvidia_tried = True
+        elif use_cf_hedge:
+            futures.append(_HEDGE_POOL.submit(_hedge_backup))
+            cf_tried = True
 
         for fut in as_completed(futures):
             try:
@@ -1231,13 +1398,23 @@ def _run_shared_cascade(
         done_event.set()
         wake_backup.set()
 
-    # Remaining Tier 1 permanent providers
+    # Ordered 5-Provider Zero-Card Cascade: Groq -> NVIDIA -> Cloudflare -> Gemini -> OpenRouter
     if not groq_tried:
         raw_groq = _call_compat_pool("groq", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
         if raw_groq:
             return raw_groq
 
-    if not gemini_tried and gemini_ready:
+    if not nvidia_tried:
+        raw_nv = _call_compat_pool("nvidia", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+        if raw_nv:
+            return raw_nv
+
+    if not cf_tried:
+        raw_cf = _call_cloudflare_pool(contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+        if raw_cf:
+            return raw_cf
+
+    if _has_ready_gemini(deep=is_followup):
         try:
             return call_gemini_keys(
                 keys=get_pool_keys("gemini"),
@@ -1250,27 +1427,11 @@ def _run_shared_cascade(
         except Exception as exc:
             errors.append(f"Gemini: {exc}")
 
-    # Tier 2 (Permanent Recurring Backups): Mistral Free -> Cloudflare Workers AI (text) -> OpenRouter Free
-    raw_mistral = _call_compat_pool("mistral", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
-    if raw_mistral:
-        return raw_mistral
-
-    if not img_b64_str:
-        raw_cf = _call_cloudflare_pool(contents_text, sys_prompt=sys_prompt)
-        if raw_cf:
-            return raw_cf
-
     raw_or = _call_compat_pool("openrouter", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
     if raw_or:
         return raw_or
 
-    # Tier 3 (Optional Finite/Trial Overflow): Only touched if every permanent provider is saturated
-    for prov in ("cerebras", "nvidia"):
-        raw = _call_compat_pool(prov, contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
-        if raw:
-            return raw
-
-    raise RuntimeError(" | ".join(errors) or "All providers busy")
+    raise RuntimeError(" | ".join(errors) or "All 5 providers temporarily busy")
 
 
 def _unified_execute(
@@ -1281,10 +1442,24 @@ def _unified_execute(
     hedged: bool = False,
     custom_prompt: Optional[str] = None,
     device_id: Optional[str] = None,
+    ip_hash: str = "",
 ) -> dict:
+    # Strict payload size guards
+    if req.image_base64 and len(req.image_base64) > MAX_IMAGE_B64_CHARS:
+        return {
+            "detected_type": "ERROR",
+            "cursor_pill": "Image too large — crop smaller area",
+            "copy_value": "",
+            "expanded_note": "",
+            "pointer_xy": None,
+            "key_source": "POOL",
+        }
+    if req.text_content and len(req.text_content) > MAX_TEXT_CHARS:
+        req.text_content = req.text_content[:MAX_TEXT_CHARS]
+
     mode = (action_mode or "solve").strip().lower()
     if custom_prompt and custom_prompt.strip():
-        sys_prompt = custom_prompt.strip()
+        sys_prompt = custom_prompt.strip()[:3000]
     elif mode == "rewrite":
         sys_prompt = V3_REWRITE_PROMPT
     elif mode == "explain":
@@ -1358,7 +1533,7 @@ def _unified_execute(
             "key_source": "BYOK" if is_byok else "POOL",
         }
 
-    cache_key = hashlib.md5(f"v11:{raw_key}".encode()).hexdigest()
+    cache_key = hashlib.md5(f"v12:{raw_key}".encode()).hexdigest()
     dhash_key = f"dhash:{mode}:{img_dhash}" if (img_dhash and not custom_prompt) else ""
 
     for ck in (cache_key, dhash_key):
@@ -1421,13 +1596,22 @@ def _unified_execute(
                 "key_source": "BYOK",
             }
     else:
-        # Fair-use cap only applies on live pool misses (cached answers stay unlimited)
-        if not _check_pool_quota(device_id, is_pro_pool):
+        if not _check_burst_limit(ip_hash, device_id):
+            return {
+                "detected_type": "ERROR",
+                "cursor_pill": "Slow down — wait a few seconds",
+                "copy_value": "",
+                "expanded_note": "Burst protection active (10 req/min). Add your own free key in Alt+K for unlimited local speed.",
+                "pointer_xy": None,
+                "key_source": "POOL",
+            }
+
+        if not _check_pool_quota(device_id, ip_hash, is_pro_pool):
             return {
                 "detected_type": "ERROR",
                 "cursor_pill": "Daily free limit reached — add free key in Alt+K",
                 "copy_value": "",
-                "expanded_note": "Paste your own free Groq/Gemini key in Alt+K, or type share:<KEY> to unlock 200/day Pro Pool.",
+                "expanded_note": "Paste your own free Groq/Gemini/NVIDIA key in Alt+K, or type share:<KEY> to unlock 200/day Pro Pool.",
                 "pointer_xy": None,
                 "key_source": "POOL",
             }
@@ -1467,9 +1651,14 @@ def _unified_execute(
 
 
 @app.post("/analyze")
-def analyze_context(req: AnalyzeRequest):
+def analyze_context(req: AnalyzeRequest, request: Request):
     try:
-        return _unified_execute(req, action_mode="solve", preserve_notes=False)
+        return _unified_execute(
+            req,
+            action_mode="solve",
+            preserve_notes=False,
+            ip_hash=_get_client_ip_hash(request),
+        )
     except Exception as exc:
         print(f"[BACKEND ERROR]: {exc}")
         return {
@@ -1483,13 +1672,14 @@ def analyze_context(req: AnalyzeRequest):
 
 
 @app.post("/v3/analyze")
-def v3_analyze_context(req: V3AnalyzeRequest):
+def v3_analyze_context(req: V3AnalyzeRequest, request: Request):
     try:
         return _unified_execute(
             req,
             action_mode=req.action_mode or "solve",
             preserve_notes=True,
             device_id=req.device_id,
+            ip_hash=_get_client_ip_hash(request),
         )
     except Exception as exc:
         print(f"[V3 BACKEND ERROR]: {exc}")
@@ -1504,7 +1694,7 @@ def v3_analyze_context(req: V3AnalyzeRequest):
 
 
 @app.post("/v3_1/analyze")
-def v3_1_analyze_context(req: V3AnalyzeRequest):
+def v3_1_analyze_context(req: V3AnalyzeRequest, request: Request):
     try:
         return _unified_execute(
             req,
@@ -1514,6 +1704,7 @@ def v3_1_analyze_context(req: V3AnalyzeRequest):
             hedged=True,
             custom_prompt=req.custom_prompt,
             device_id=req.device_id,
+            ip_hash=_get_client_ip_hash(request),
         )
     except Exception as exc:
         print(f"[V3.1 BACKEND ERROR]: {exc}")
