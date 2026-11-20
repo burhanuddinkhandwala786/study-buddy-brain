@@ -93,11 +93,16 @@ GEMINI_DEEP_MODELS = [
 # Evergreen -latest aliases on Mistral never break on version retirement
 MISTRAL_TEXT_MODELS = [
     "mistral-small-latest",
-    "mistral-large-latest",
 ]
 MISTRAL_VISION_MODELS = [
     "mistral-small-latest",
-    "mistral-large-latest",
+]
+
+# Cloudflare Workers AI: 10,000 free Neurons/day permanently (resets 00:00 UTC, no card)
+CLOUDFLARE_TEXT_MODELS = [
+    "@cf/google/gemma-4-26b-a4b-it",
+    "@cf/nvidia/nemotron-3-120b-a12b",
+    "@cf/zai-org/glm-4.7-flash",
 ]
 
 NVIDIA_TEXT_MODELS = [
