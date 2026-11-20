@@ -20,7 +20,7 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Cursor Companion Brain", version="6.0.0")
+app = FastAPI(title="Cursor Companion Brain", version="6.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,25 +51,18 @@ _DISCOVERED_MODELS = {}
 _DISCOVERY_TTL = 21600  # 6 hours
 
 _COMMUNITY_KEYS = {
-    "cerebras": [],
     "groq": [],
     "gemini": [],
     "mistral": [],
-    "nvidia": [],
     "openrouter": [],
+    "cerebras": [],
+    "nvidia": [],
 }
 _PRO_DEVICES = set()
 _COMMUNITY_LOCK = threading.Lock()
 
-# Verified Active Models (Nov 2026) — zero retired slugs
-CEREBRAS_TEXT_MODELS = [
-    "gpt-oss-120b",
-    "qwen-3.8-27b",
-]
-CEREBRAS_VISION_MODELS = [
-    "qwen-3.8-27b",
-]
-
+# --- Verified Active Models (Nov 2026) ---
+# Tier 1: Permanent Recurring Daily Free Tiers
 GROQ_TEXT_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
@@ -90,7 +83,8 @@ GEMINI_DEEP_MODELS = [
     "gemini-3.5-flash-lite",
 ]
 
-# Evergreen -latest aliases on Mistral never break on version retirement
+# Tier 2: Permanent Recurring Backups
+# Mistral Free Mode reliably serves mistral-small-latest (evergreen alias)
 MISTRAL_TEXT_MODELS = [
     "mistral-small-latest",
 ]
@@ -98,11 +92,30 @@ MISTRAL_VISION_MODELS = [
     "mistral-small-latest",
 ]
 
-# Cloudflare Workers AI: 10,000 free Neurons/day permanently (resets 00:00 UTC, no card)
+# Cloudflare Workers AI: 10,000 free Neurons/day permanently (resets 00:00 UTC)
 CLOUDFLARE_TEXT_MODELS = [
     "@cf/google/gemma-4-26b-a4b-it",
     "@cf/nvidia/nemotron-3-120b-a12b",
     "@cf/zai-org/glm-4.7-flash",
+]
+
+# OpenRouter evergreen auto-routing safety net
+OPENROUTER_TEXT_MODELS = [
+    "openrouter/free",
+    "google/gemma-4-31b-it:free",
+]
+OPENROUTER_VISION_MODELS = [
+    "openrouter/free",
+    "google/gemma-4-31b-it:free",
+]
+
+# Tier 3: Optional Finite/Trial Overflow (auto-quarantined 24h on HTTP 402)
+CEREBRAS_TEXT_MODELS = [
+    "gpt-oss-120b",
+    "qwen-3.8-27b",
+]
+CEREBRAS_VISION_MODELS = [
+    "qwen-3.8-27b",
 ]
 
 NVIDIA_TEXT_MODELS = [
@@ -114,24 +127,7 @@ NVIDIA_VISION_MODELS = [
     "mistralai/mistral-large-4-1t-a52b",
 ]
 
-# openrouter/free auto-routes to live free text/vision models indefinitely
-OPENROUTER_TEXT_MODELS = [
-    "openrouter/free",
-    "google/gemma-4-31b-it:free",
-]
-OPENROUTER_VISION_MODELS = [
-    "openrouter/free",
-    "google/gemma-4-31b-it:free",
-]
-
 PROVIDER_META = {
-    "cerebras": {
-        "env": "CEREBRAS_API_KEY",
-        "chat_url": "https://api.cerebras.ai/v1/chat/completions",
-        "models_url": "https://api.cerebras.ai/v1/models",
-        "text": CEREBRAS_TEXT_MODELS,
-        "vision": CEREBRAS_VISION_MODELS,
-    },
     "groq": {
         "env": "GROQ_API_KEY",
         "chat_url": "https://api.groq.com/openai/v1/chat/completions",
@@ -146,19 +142,26 @@ PROVIDER_META = {
         "text": MISTRAL_TEXT_MODELS,
         "vision": MISTRAL_VISION_MODELS,
     },
-    "nvidia": {
-        "env": "NVIDIA_API_KEY",
-        "chat_url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "models_url": "https://integrate.api.nvidia.com/v1/models",
-        "text": NVIDIA_TEXT_MODELS,
-        "vision": NVIDIA_VISION_MODELS,
-    },
     "openrouter": {
         "env": "OPENROUTER_API_KEY",
         "chat_url": "https://openrouter.ai/api/v1/chat/completions",
         "models_url": "https://openrouter.ai/api/v1/models",
         "text": OPENROUTER_TEXT_MODELS,
         "vision": OPENROUTER_VISION_MODELS,
+    },
+    "cerebras": {
+        "env": "CEREBRAS_API_KEY",
+        "chat_url": "https://api.cerebras.ai/v1/chat/completions",
+        "models_url": "https://api.cerebras.ai/v1/models",
+        "text": CEREBRAS_TEXT_MODELS,
+        "vision": CEREBRAS_VISION_MODELS,
+    },
+    "nvidia": {
+        "env": "NVIDIA_API_KEY",
+        "chat_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "models_url": "https://integrate.api.nvidia.com/v1/models",
+        "text": NVIDIA_TEXT_MODELS,
+        "vision": NVIDIA_VISION_MODELS,
     },
 }
 
@@ -205,7 +208,7 @@ Output ONLY a single raw JSON object:
 Rules: cursor_pill = 1-line takeaway (max 70 chars); copy_value = same takeaway; expanded_note = 3 short bullet points."""
 
 
-# --- Optional Persistent Upstash Redis REST Store (zero extra pip deps) ---
+# --- Persistent Upstash Redis REST Store (zero extra pip deps) ---
 def _redis_cfg():
     url = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
     token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
@@ -249,7 +252,6 @@ def _init_db():
     except Exception:
         pass
 
-    # Hydrate community keys & pro devices from Upstash Redis if configured
     raw_pool = _redis_cmd("GET", "cc:v1:community_pool")
     if isinstance(raw_pool, str) and raw_pool:
         try:
@@ -338,6 +340,22 @@ def _persist_community_pool(provider: str, api_key: str, device_id: str):
     _redis_cmd("SET", "cc:v1:community_pool", json.dumps(snapshot))
 
 
+def _check_pool_quota(device_id: Optional[str], is_pro: bool) -> bool:
+    """Per-device daily shared-pool cap via Upstash Redis (cache hits stay free & unlimited)."""
+    if not device_id or not _redis_cfg()[0]:
+        return True
+    try:
+        limit = int(os.environ.get("DAILY_PRO_LIMIT", "200") if is_pro else os.environ.get("DAILY_FREE_LIMIT", "35"))
+    except ValueError:
+        limit = 200 if is_pro else 35
+    day = time.strftime("%Y%m%d", time.gmtime())
+    rk = f"cc:rl:{device_id}:{day}"
+    count = _redis_cmd("INCR", rk)
+    if count == 1:
+        _redis_cmd("EXPIRE", rk, 86400)
+    return not (isinstance(count, int) and count > limit)
+
+
 def get_env_keys(env_name: str):
     return [
         key.strip().strip('"').strip("'")
@@ -354,6 +372,12 @@ def get_pool_keys(provider: str):
             if ck not in keys:
                 keys.append(ck)
     return keys
+
+
+def _get_cloudflare_cfg():
+    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    keys = get_env_keys("CLOUDFLARE_API_KEY")
+    return (account_id, keys) if (account_id and keys) else ("", [])
 
 
 def parse_user_keys(raw_user_keys: Optional[str]):
@@ -396,7 +420,6 @@ def normalize_quiz_hash(text: str) -> str:
 
 
 def _image_dhash(img_pil: Image.Image) -> str:
-    """64-bit perceptual difference hash so near-identical screenshots share cache."""
     gray = img_pil.convert("L").resize((9, 8), Image.LANCZOS)
     pixels = list(gray.getdata())
     bits = []
@@ -432,14 +455,12 @@ def _get_client(api_key: str):
         with _GEMINI_CLIENTS_LOCK:
             client = _GEMINI_CLIENTS.get(api_key)
             if client is None:
-                # Google API minimum deadline is 10s; 12s stays safely above threshold
                 client = genai.Client(api_key=api_key, http_options={"timeout": 12000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
 
 
 def _discover_live_models(provider_tag: str, api_key: str, want_vision: bool = False) -> list:
-    """Self-healing live model discovery if hardcoded slugs are ever retired in future."""
     meta = PROVIDER_META.get(provider_tag)
     if not meta:
         return []
@@ -481,18 +502,20 @@ def _discover_live_models(provider_tag: str, api_key: str, want_vision: bool = F
 @app.api_route("/healthz", methods=["GET", "HEAD"])
 def health():
     now = time.time()
+    _, cf_keys = _get_cloudflare_cfg()
     with _COMMUNITY_LOCK:
         community_total = sum(len(v) for v in _COMMUNITY_KEYS.values())
         pro_count = len(_PRO_DEVICES)
     return {
         "status": "ok",
-        "engine": "v6.0.0-immortal",
-        "cerebras_keys": len(get_pool_keys("cerebras")),
-        "gemini_keys": len(get_pool_keys("gemini")),
+        "engine": "v6.1.0-prod",
         "groq_keys": len(get_pool_keys("groq")),
+        "gemini_keys": len(get_pool_keys("gemini")),
         "mistral_keys": len(get_pool_keys("mistral")),
-        "nvidia_keys": len(get_pool_keys("nvidia")),
+        "cloudflare_keys": len(cf_keys),
         "openrouter_keys": len(get_pool_keys("openrouter")),
+        "cerebras_keys": len(get_pool_keys("cerebras")),
+        "nvidia_keys": len(get_pool_keys("nvidia")),
         "community_keys": community_total,
         "pro_devices": pro_count,
         "persistent_cache": bool(_redis_cfg()[0]),
@@ -501,15 +524,41 @@ def health():
     }
 
 
+@app.get("/v3_1/config")
+def remote_client_config():
+    return {
+        "latest_version": os.environ.get("APP_LATEST_VERSION", "3.1.0").strip(),
+        "release_url": os.environ.get(
+            "APP_RELEASE_URL",
+            "https://github.com/burhanuddinkhandwala786/cursor-companion/releases/latest",
+        ).strip(),
+        "notice": os.environ.get("APP_NOTICE", "").strip(),
+        "byok_models": {
+            "groq_text": GROQ_TEXT_MODELS,
+            "groq_vision": GROQ_VISION_MODELS,
+            "gemini": GEMINI_FAST_MODELS,
+            "mistral_text": MISTRAL_TEXT_MODELS,
+            "mistral_vision": MISTRAL_VISION_MODELS,
+            "openrouter_text": OPENROUTER_TEXT_MODELS,
+            "openrouter_vision": OPENROUTER_VISION_MODELS,
+            "cerebras_text": CEREBRAS_TEXT_MODELS,
+            "cerebras_vision": CEREBRAS_VISION_MODELS,
+            "nvidia_text": NVIDIA_TEXT_MODELS,
+            "nvidia_vision": NVIDIA_VISION_MODELS,
+        },
+    }
+
+
 @app.get("/diag")
 def diagnose_keys():
     report = {
-        "cerebras": "not_configured",
         "groq": "not_configured",
         "gemini": [],
         "mistral": "not_configured",
-        "nvidia": "not_configured",
+        "cloudflare": "not_configured",
         "openrouter": "not_configured",
+        "cerebras": "not_configured",
+        "nvidia": "not_configured",
     }
 
     for index, api_key in enumerate(get_pool_keys("gemini"), 1):
@@ -532,7 +581,7 @@ def diagnose_keys():
                 "reason": str(exc)[:120],
             })
 
-    for tag in ("cerebras", "groq", "mistral", "nvidia", "openrouter"):
+    for tag in ("groq", "mistral", "openrouter", "cerebras", "nvidia"):
         keys = get_pool_keys(tag)
         if not keys:
             continue
@@ -551,6 +600,22 @@ def diagnose_keys():
         except Exception as exc:
             report[tag] = f"ERROR: {str(exc)[:100]}"
 
+    cf_acc, cf_keys = _get_cloudflare_cfg()
+    if cf_acc and cf_keys:
+        try:
+            r = _HTTP_CLIENT.post(
+                f"https://api.cloudflare.com/client/v4/accounts/{cf_acc}/ai/v1/chat/completions",
+                json={
+                    "model": CLOUDFLARE_TEXT_MODELS[0],
+                    "messages": [{"role": "user", "content": "Reply OK"}],
+                    "max_tokens": 24,
+                },
+                headers={"Authorization": f"Bearer {cf_keys[0]}", "Content-Type": "application/json"},
+            )
+            report["cloudflare"] = "HEALTHY" if r.status_code == 200 else f"HTTP {r.status_code}: {r.text[:100]}"
+        except Exception as exc:
+            report["cloudflare"] = f"ERROR: {str(exc)[:100]}"
+
     return report
 
 
@@ -559,8 +624,9 @@ def diagnose_keys():
 def self_test():
     results = {}
     t0 = time.time()
+    probe = 'Return JSON: {"verification":"ok","detected_type":"DIRECT_VALUE","cursor_pill":"2","copy_value":"2","expanded_note":"","pointer_xy":null}'
 
-    for tag in ("cerebras", "groq", "mistral", "nvidia", "openrouter"):
+    for tag in ("groq", "mistral", "openrouter", "cerebras", "nvidia"):
         keys = get_pool_keys(tag)
         if not keys:
             results[f"{tag}_pipeline"] = {"status": "SKIPPED (not configured)"}
@@ -571,12 +637,26 @@ def self_test():
                 endpoint=meta["chat_url"],
                 api_key=keys[0],
                 models=meta["text"],
-                prompt_text='Return JSON: {"verification":"ok","detected_type":"DIRECT_VALUE","cursor_pill":"2","copy_value":"2","expanded_note":"","pointer_xy":null}',
+                prompt_text=probe,
                 provider_tag=tag,
             )
             results[f"{tag}_pipeline"] = {"status": "200 OK", "output": extract_json(raw).get("cursor_pill")}
         except Exception as exc:
             results[f"{tag}_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
+
+    cf_acc, cf_keys = _get_cloudflare_cfg()
+    if cf_acc and cf_keys:
+        try:
+            raw_cf = _call_cloudflare_pool(probe)
+            results["cloudflare_pipeline"] = (
+                {"status": "200 OK", "output": extract_json(raw_cf).get("cursor_pill")}
+                if raw_cf
+                else {"status": "FAIL", "error": "Cloudflare returned empty"}
+            )
+        except Exception as exc:
+            results["cloudflare_pipeline"] = {"status": "FAIL", "error": str(exc)[:120]}
+    else:
+        results["cloudflare_pipeline"] = {"status": "SKIPPED (not configured)"}
 
     gemini_keys = get_pool_keys("gemini")
     if gemini_keys:
@@ -618,9 +698,8 @@ def contribute_community_key(req: ContributeKeyRequest):
 
     prov, clean_key = detect_key_provider(keys[0])
     if prov not in _COMMUNITY_KEYS:
-        return {"ok": False, "message": "Use a Cerebras (csk-), Groq (gsk_), Gemini (AIza), Mistral (mistral:), NVIDIA (nvapi-), or OpenRouter (sk-or-) key"}
+        return {"ok": False, "message": "Use a Groq (gsk_), Gemini (AIza), Mistral (mistral:), OpenRouter (sk-or-), Cerebras (csk-), or NVIDIA (nvapi-) key"}
 
-    # Live-verify the key before adding it to the shared pool
     try:
         if prov == "gemini":
             client = _get_client(clean_key)
@@ -734,6 +813,7 @@ def _classify_gemini_error(error_text: str) -> str:
         return "rate_limit"
     if (
         "401" in error_text
+        or "402" in error_text
         or "403" in error_text
         or "permission_denied" in lowered
         or "api_key_invalid" in lowered
@@ -872,7 +952,6 @@ def call_openai_compat(
 
         if KEY_COOLDOWN.get(f"{provider_tag}:{api_key}", 0) > time.time():
             break
-        # Modality-isolated cooldown prevents a vision 400 from ever disabling text requests
         cooldown_key = f"{provider_tag}:{api_key}:{model_id}:{modality}"
         if KEY_COOLDOWN.get(cooldown_key, 0) > time.time():
             continue
@@ -939,16 +1018,16 @@ def call_openai_compat(
                 pass
 
         last_error = f"{provider_tag} {model_id}: HTTP {response.status_code}"
-        if response.status_code in (401, 403):
-            KEY_COOLDOWN[f"{provider_tag}:{api_key}"] = time.time() + 3600
+        # Auto-quarantine expired trials (402) for 24h & auth failures (401/403) for 1h
+        if response.status_code in (401, 402, 403):
+            KEY_COOLDOWN[f"{provider_tag}:{api_key}"] = time.time() + (86400 if response.status_code == 402 else 3600)
             if is_byok:
-                raise RuntimeError("BYOK_INVALID: Invalid personal API key (Alt+K)")
+                raise RuntimeError("BYOK_INVALID: Key invalid or credit exhausted (Alt+K)")
             break
         if response.status_code in (429, 503, 504):
             KEY_COOLDOWN[cooldown_key] = time.time() + (45 if response.status_code >= 500 else 25)
         elif response.status_code in (400, 404, 410):
             KEY_COOLDOWN[cooldown_key] = time.time() + 21600
-            # Self-healing: if hardcoded models are ever retired, dynamically fetch live models
             if not discovered_added and idx >= len(candidate_models):
                 discovered_added = True
                 candidate_models.extend(_discover_live_models(provider_tag, api_key, want_vision=bool(img_b64)))
@@ -966,7 +1045,7 @@ def _route_server_byok(
     deep: bool = False,
     sys_prompt: str = PROMPT,
 ) -> str:
-    grouped = {k: [] for k in ("cerebras", "groq", "gemini", "mistral", "nvidia", "openrouter", "openai")}
+    grouped = {k: [] for k in ("groq", "gemini", "mistral", "openrouter", "cerebras", "nvidia", "openai")}
     for raw_k in user_keys:
         prov, clean_k = detect_key_provider(raw_k)
         if prov in grouped:
@@ -977,7 +1056,7 @@ def _route_server_byok(
 
     errors = []
 
-    for prov in ("cerebras", "groq", "mistral", "nvidia", "openrouter"):
+    for prov in ("groq", "mistral", "openrouter", "cerebras", "nvidia"):
         meta = PROVIDER_META[prov]
         for api_key in grouped[prov]:
             try:
@@ -1048,6 +1127,30 @@ def _call_compat_pool(provider_tag: str, prompt_text: str, img_b64: Optional[str
     return None
 
 
+def _call_cloudflare_pool(prompt_text: str, sys_prompt: str = PROMPT) -> Optional[str]:
+    account_id, keys = _get_cloudflare_cfg()
+    if not account_id or not keys:
+        return None
+    endpoint = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
+    for api_key in keys:
+        try:
+            res = call_openai_compat(
+                endpoint=endpoint,
+                api_key=api_key,
+                models=CLOUDFLARE_TEXT_MODELS,
+                prompt_text=prompt_text,
+                img_b64=None,
+                provider_tag="cloudflare",
+                is_byok=False,
+                sys_prompt=sys_prompt,
+            )
+            if res:
+                return res
+        except Exception:
+            continue
+    return None
+
+
 def _has_ready_gemini(deep: bool = False) -> bool:
     now = time.time()
     models = GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS
@@ -1069,66 +1172,72 @@ def _run_shared_cascade(
     hedged: bool = False,
 ) -> str:
     errors = []
-
-    # Tier 1: Cerebras (3,000 tok/s text, 1,850 tok/s vision, 1M free tokens/day) — instant sub-second win
-    raw_cerebras = _call_compat_pool("cerebras", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
-    if raw_cerebras:
-        return raw_cerebras
-
     gemini_ready = _has_ready_gemini(deep=is_followup)
     groq_tried = False
+    gemini_tried = False
 
-    # Tier 2: Hedged Gemini + Groq (wakes Groq instantly if Gemini errors or after 1.6s)
-    if hedged and gemini_ready:
+    # Tier 1 (Permanent Recurring): Groq lead + staggered Gemini backup (1.8s)
+    if hedged and get_pool_keys("groq"):
         done_event = threading.Event()
-        wake_groq = threading.Event()
+        wake_backup = threading.Event()
 
-        def _gemini_branch():
+        def _groq_lead():
             try:
-                res = call_gemini_keys(
-                    keys=get_pool_keys("gemini"),
-                    prompt_text=contents_text,
-                    img_pil=img_pil,
-                    deep=is_followup,
-                    is_byok=False,
-                    sys_prompt=sys_prompt,
-                )
+                res = _call_compat_pool("groq", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
                 if res:
                     done_event.set()
-                    wake_groq.set()
-                return res
+                    wake_backup.set()
+                    return res
+                wake_backup.set()
+                raise RuntimeError("Groq unavailable")
             except Exception:
-                wake_groq.set()
+                wake_backup.set()
                 raise
 
-        def _groq_staggered_branch():
-            wake_groq.wait(1.6)
+        def _gemini_backup():
+            if not gemini_ready:
+                raise RuntimeError("Gemini cooling down")
+            wake_backup.wait(1.8)
             if done_event.is_set():
                 raise RuntimeError("Cancelled")
-            res = _call_compat_pool("groq", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
-            if not res:
-                raise RuntimeError("Groq unavailable")
-            done_event.set()
+            res = call_gemini_keys(
+                keys=get_pool_keys("gemini"),
+                prompt_text=contents_text,
+                img_pil=img_pil,
+                deep=is_followup,
+                is_byok=False,
+                sys_prompt=sys_prompt,
+            )
+            if res:
+                done_event.set()
             return res
 
-        futures = [
-            _HEDGE_POOL.submit(_gemini_branch),
-            _HEDGE_POOL.submit(_groq_staggered_branch),
-        ]
+        futures = [_HEDGE_POOL.submit(_groq_lead)]
         groq_tried = True
+        if gemini_ready:
+            futures.append(_HEDGE_POOL.submit(_gemini_backup))
+            gemini_tried = True
+
         for fut in as_completed(futures):
             try:
                 out = fut.result()
                 if out:
                     done_event.set()
-                    wake_groq.set()
+                    wake_backup.set()
                     return out
             except Exception as exc:
                 if str(exc) != "Cancelled":
                     errors.append(str(exc))
         done_event.set()
-        wake_groq.set()
-    elif gemini_ready:
+        wake_backup.set()
+
+    # Remaining Tier 1 permanent providers
+    if not groq_tried:
+        raw_groq = _call_compat_pool("groq", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+        if raw_groq:
+            return raw_groq
+
+    if not gemini_tried and gemini_ready:
         try:
             return call_gemini_keys(
                 keys=get_pool_keys("gemini"),
@@ -1141,10 +1250,22 @@ def _run_shared_cascade(
         except Exception as exc:
             errors.append(f"Gemini: {exc}")
 
-    # Tier 3: Ordered rock-solid fallbacks (Groq -> Mistral -> NVIDIA NIM -> OpenRouter evergreen free)
-    for prov in ("groq", "mistral", "nvidia", "openrouter"):
-        if prov == "groq" and groq_tried:
-            continue
+    # Tier 2 (Permanent Recurring Backups): Mistral Free -> Cloudflare Workers AI (text) -> OpenRouter Free
+    raw_mistral = _call_compat_pool("mistral", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+    if raw_mistral:
+        return raw_mistral
+
+    if not img_b64_str:
+        raw_cf = _call_cloudflare_pool(contents_text, sys_prompt=sys_prompt)
+        if raw_cf:
+            return raw_cf
+
+    raw_or = _call_compat_pool("openrouter", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
+    if raw_or:
+        return raw_or
+
+    # Tier 3 (Optional Finite/Trial Overflow): Only touched if every permanent provider is saturated
+    for prov in ("cerebras", "nvidia"):
         raw = _call_compat_pool(prov, contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt)
         if raw:
             return raw
@@ -1173,7 +1294,8 @@ def _unified_execute(
 
     user_keys = parse_user_keys(req.user_api_key)
     is_byok = bool(user_keys)
-    is_pro_pool = bool(device_id and device_id in _PRO_DEVICES and not is_byok)
+    with _COMMUNITY_LOCK:
+        is_pro_pool = bool(device_id and device_id in _PRO_DEVICES and not is_byok)
 
     txt = (req.text_content or "").strip()
     if txt.upper().startswith("TEST:") or (req.user_api_key or "").strip().lower() == "test":
@@ -1284,7 +1406,7 @@ def _unified_execute(
             if err_msg.startswith("BYOK_INVALID"):
                 return {
                     "detected_type": "ERROR",
-                    "cursor_pill": "Invalid personal API key (Alt+K)",
+                    "cursor_pill": "Invalid or expired personal key (Alt+K)",
                     "copy_value": "",
                     "expanded_note": "",
                     "pointer_xy": None,
@@ -1299,6 +1421,17 @@ def _unified_execute(
                 "key_source": "BYOK",
             }
     else:
+        # Fair-use cap only applies on live pool misses (cached answers stay unlimited)
+        if not _check_pool_quota(device_id, is_pro_pool):
+            return {
+                "detected_type": "ERROR",
+                "cursor_pill": "Daily free limit reached — add free key in Alt+K",
+                "copy_value": "",
+                "expanded_note": "Paste your own free Groq/Gemini key in Alt+K, or type share:<KEY> to unlock 200/day Pro Pool.",
+                "pointer_xy": None,
+                "key_source": "POOL",
+            }
+
         raw_json = _run_shared_cascade(
             contents_text=contents_text,
             img_pil=img_pil,
