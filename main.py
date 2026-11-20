@@ -1150,7 +1150,7 @@ def call_openai_compat(
             "max_tokens": 1100,
         }
         if provider_tag == "groq" and "gpt-oss" in model_id:
-            payload_body["reasoning_effort"] = "medium"
+            payload_body["reasoning_effort"] = "low"
         if provider_tag in ("groq", "cerebras", "mistral") and not img_b64:
             payload_body["response_format"] = {"type": "json_object"}
 
