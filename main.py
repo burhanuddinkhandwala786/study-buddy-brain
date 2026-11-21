@@ -11,7 +11,7 @@ import itertools
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
-from typing import Optional
+from typing import Optional, List
 
 from PIL import Image
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -27,7 +27,7 @@ Image.MAX_IMAGE_PIXELS = 25_000_000
 MAX_IMAGE_B64_CHARS = 5_500_000  # ~4 MB decoded image cap
 MAX_TEXT_CHARS = 25_000
 
-app = FastAPI(title="Cursor Companion Brain", version="7.2.0")
+app = FastAPI(title="Cursor Companion Brain", version="7.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,8 +52,14 @@ async def add_security_headers(request: Request, call_next):
 
 
 # Fast HTTP clients prevent 20-30s provider stalls
-_HTTP_CLIENT = httpx.Client(timeout=8.5)
-_REDIS_CLIENT = httpx.Client(timeout=1.5)
+_HTTP_CLIENT = httpx.Client(
+    timeout=8.5,
+    limits=httpx.Limits(max_connections=64, max_keepalive_connections=24),
+)
+_REDIS_CLIENT = httpx.Client(
+    timeout=1.8,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+)
 _HEDGE_POOL = ThreadPoolExecutor(max_workers=24)
 
 IMAGE_CACHE = {}
@@ -63,6 +69,7 @@ QUIZ_CACHE = {}
 QUIZ_CACHE_TTL = 7200
 
 KEY_COOLDOWN = {}
+_CACHE_LOCK = threading.Lock()
 _KEY_CYCLE = itertools.count()
 
 _LOCAL_BURST = {}
@@ -82,7 +89,10 @@ _COMMUNITY_KEYS = {
     "nvidia": [],
     "openrouter": [],
 }
+_KEY_FINGERPRINTS = set()  # Global SHA-256 fingerprints of contributed keys
+_DEVICE_CONTRIBUTIONS = {}  # { device_id: {"fingerprints": [...], "providers": [...]} }
 _PRO_DEVICES = set()
+_PRO_DEVICE_CAPS = {}  # { device_id: daily_limit }
 _COMMUNITY_LOCK = threading.Lock()
 
 # --- Verified Active Zero-Card Models (Nov 2026) ---
@@ -231,7 +241,8 @@ Rules: cursor_pill = 1-line takeaway (max 70 chars); copy_value = same takeaway;
 # --- Authenticated Encryption at Rest (Stdlib Encrypt-then-MAC, Zero Extra Deps) ---
 def _get_master_key() -> bytes:
     seed = (
-        os.environ.get("APP_ENCRYPTION_SECRET", "").strip()
+        os.environ.get("POOL_KEY_SECRET", "").strip()
+        or os.environ.get("APP_ENCRYPTION_SECRET", "").strip()
         or os.environ.get("ADMIN_SECRET", "").strip()
         or os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
         or "cursor-companion-default-v7-key-material"
@@ -282,6 +293,22 @@ def _decrypt_secret(blob: str) -> str:
         return ""
 
 
+def _key_fingerprint(provider: str, api_key: str) -> str:
+    return hashlib.sha256(f"{provider}:{api_key}".encode("utf-8")).hexdigest()[:32]
+
+
+def _tier_limit_for_contributions(key_count: int, provider_count: int) -> int:
+    try:
+        base_pro = int(os.environ.get("DAILY_PRO_LIMIT", "150"))
+    except ValueError:
+        base_pro = 150
+    if key_count >= 3 and provider_count >= 2:
+        return max(base_pro, 750)
+    if key_count >= 2:
+        return max(base_pro, 350)
+    return base_pro
+
+
 def _require_admin(request: Request, secret: Optional[str] = None):
     expected = os.environ.get("ADMIN_SECRET", "").strip()
     if not expected:
@@ -299,6 +326,22 @@ def _get_client_ip_hash(request: Optional[Request]) -> str:
     if not ip:
         return ""
     return hashlib.sha256(_get_master_key() + ip.encode("utf-8")).hexdigest()[:20]
+
+
+def _set_cooldown(key: str, seconds: int):
+    now = time.time()
+    with _CACHE_LOCK:
+        KEY_COOLDOWN[key] = now + seconds
+        if len(KEY_COOLDOWN) > 500:
+            expired = [k for k, exp in KEY_COOLDOWN.items() if exp <= now]
+            for k in expired:
+                KEY_COOLDOWN.pop(k, None)
+
+
+def _is_cooling_down(key: str, now: Optional[float] = None) -> bool:
+    t = now if now is not None else time.time()
+    with _CACHE_LOCK:
+        return KEY_COOLDOWN.get(key, 0) > t
 
 
 # --- Persistent Upstash Redis REST Store (Single-RTT Pipeline) ---
@@ -354,17 +397,49 @@ def _init_db():
                 "(key_hash TEXT PRIMARY KEY, provider TEXT, api_key_enc TEXT, device_id TEXT, ts REAL)"
             )
             conn.execute("CREATE TABLE IF NOT EXISTS pro_devices (device_id TEXT PRIMARY KEY, ts REAL)")
-            rows = conn.execute("SELECT provider, api_key_enc FROM community_keys_v2").fetchall()
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS device_contrib_v2 "
+                "(device_id TEXT PRIMARY KEY, payload TEXT, daily_cap INTEGER, ts REAL)"
+            )
+            rows = conn.execute("SELECT provider, api_key_enc, device_id FROM community_keys_v2").fetchall()
             pro_rows = conn.execute("SELECT device_id FROM pro_devices").fetchall()
+            contrib_rows = conn.execute("SELECT device_id, payload, daily_cap FROM device_contrib_v2").fetchall()
             conn.commit()
             conn.close()
+
         with _COMMUNITY_LOCK:
-            for prov, enc_key in rows:
+            for prov, enc_key, dev_id in rows:
                 plain_k = _decrypt_secret(enc_key)
-                if plain_k and prov in _COMMUNITY_KEYS and plain_k not in _COMMUNITY_KEYS[prov]:
-                    _COMMUNITY_KEYS[prov].append(plain_k)
+                if plain_k and prov in _COMMUNITY_KEYS:
+                    if plain_k not in _COMMUNITY_KEYS[prov]:
+                        _COMMUNITY_KEYS[prov].append(plain_k)
+                    fp = _key_fingerprint(prov, plain_k)
+                    _KEY_FINGERPRINTS.add(fp)
+                    if dev_id:
+                        entry = _DEVICE_CONTRIBUTIONS.setdefault(dev_id, {"fingerprints": [], "providers": []})
+                        if fp not in entry["fingerprints"]:
+                            entry["fingerprints"].append(fp)
+                        if prov not in entry["providers"]:
+                            entry["providers"].append(prov)
             for (dev,) in pro_rows:
+                if dev:
+                    _PRO_DEVICES.add(dev)
+                    _PRO_DEVICE_CAPS.setdefault(dev, _tier_limit_for_contributions(1, 1))
+            for dev, payload_str, cap in contrib_rows:
+                if not dev:
+                    continue
                 _PRO_DEVICES.add(dev)
+                try:
+                    parsed = json.loads(payload_str)
+                    if isinstance(parsed, dict):
+                        fps = list(dict.fromkeys(parsed.get("fingerprints", [])))
+                        provs = list(dict.fromkeys(parsed.get("providers", [])))
+                        _DEVICE_CONTRIBUTIONS[dev] = {"fingerprints": fps, "providers": provs}
+                        computed = _tier_limit_for_contributions(len(fps), len(provs))
+                        _PRO_DEVICE_CAPS[dev] = max(int(cap or 0), computed)
+                except Exception:
+                    if cap:
+                        _PRO_DEVICE_CAPS[dev] = max(_PRO_DEVICE_CAPS.get(dev, 0), int(cap))
     except Exception:
         pass
 
@@ -378,10 +453,37 @@ def _init_db():
                         if prov in _COMMUNITY_KEYS and isinstance(key_list, list):
                             for blob in key_list:
                                 plain_k = _decrypt_secret(blob)
-                                if plain_k and plain_k not in _COMMUNITY_KEYS[prov]:
-                                    _COMMUNITY_KEYS[prov].append(plain_k)
+                                if plain_k:
+                                    if plain_k not in _COMMUNITY_KEYS[prov]:
+                                        _COMMUNITY_KEYS[prov].append(plain_k)
+                                    _KEY_FINGERPRINTS.add(_key_fingerprint(prov, plain_k))
+                    for fp in saved.get("fingerprints", []):
+                        if isinstance(fp, str) and fp:
+                            _KEY_FINGERPRINTS.add(fp)
                     for dev in saved.get("pro_devices", []):
+                        if dev:
+                            _PRO_DEVICES.add(dev)
+                            _PRO_DEVICE_CAPS.setdefault(dev, _tier_limit_for_contributions(1, 1))
+                    for dev, stats in saved.get("device_contributions", {}).items():
+                        if not dev or not isinstance(stats, dict):
+                            continue
+                        existing = _DEVICE_CONTRIBUTIONS.setdefault(dev, {"fingerprints": [], "providers": []})
+                        for fp in stats.get("fingerprints", []):
+                            if fp not in existing["fingerprints"]:
+                                existing["fingerprints"].append(fp)
+                            _KEY_FINGERPRINTS.add(fp)
+                        for p in stats.get("providers", []):
+                            if p not in existing["providers"]:
+                                existing["providers"].append(p)
                         _PRO_DEVICES.add(dev)
+                        computed = _tier_limit_for_contributions(
+                            len(existing["fingerprints"]), len(existing["providers"])
+                        )
+                        _PRO_DEVICE_CAPS[dev] = max(_PRO_DEVICE_CAPS.get(dev, 0), computed)
+                    for dev, cap in saved.get("pro_caps", {}).items():
+                        if dev and isinstance(cap, int):
+                            _PRO_DEVICES.add(dev)
+                            _PRO_DEVICE_CAPS[dev] = max(_PRO_DEVICE_CAPS.get(dev, 0), cap)
             except Exception:
                 pass
 
@@ -429,50 +531,93 @@ def _db_put(qhash: str, payload: dict):
         pass
 
 
-def _persist_community_pool(provider: str, api_key: str, device_id: str):
-    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-    enc_val = _encrypt_secret(api_key)
+def _persist_community_batch(new_records: list, device_id: str, daily_cap: int, dev_stats: dict):
+    """Persists newly verified encrypted keys + cumulative device tier to SQLite and Upstash Redis."""
     with _COMMUNITY_LOCK:
-        if provider in _COMMUNITY_KEYS and api_key not in _COMMUNITY_KEYS[provider]:
-            _COMMUNITY_KEYS[provider].append(api_key)
-        if device_id:
-            _PRO_DEVICES.add(device_id)
         encrypted_snapshot = {
             "keys": {k: [_encrypt_secret(val) for val in v] for k, v in _COMMUNITY_KEYS.items()},
-            "pro_devices": list(_PRO_DEVICES),
+            "fingerprints": sorted(_KEY_FINGERPRINTS),
+            "pro_devices": sorted(_PRO_DEVICES),
+            "device_contributions": {
+                d: {
+                    "fingerprints": list(s.get("fingerprints", [])),
+                    "providers": list(s.get("providers", [])),
+                }
+                for d, s in _DEVICE_CONTRIBUTIONS.items()
+            },
+            "pro_caps": dict(_PRO_DEVICE_CAPS),
         }
+
+    now = time.time()
     try:
         with _DB_LOCK:
             conn = sqlite3.connect(_DB_PATH)
-            conn.execute(
-                "INSERT OR REPLACE INTO community_keys_v2 (key_hash, provider, api_key_enc, device_id, ts) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (key_hash, provider, enc_val, device_id or "", time.time()),
-            )
+            for prov, api_key, fp in new_records:
+                conn.execute(
+                    "INSERT OR REPLACE INTO community_keys_v2 (key_hash, provider, api_key_enc, device_id, ts) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (fp, prov, _encrypt_secret(api_key), device_id or "", now),
+                )
             if device_id:
                 conn.execute(
                     "INSERT OR REPLACE INTO pro_devices (device_id, ts) VALUES (?, ?)",
-                    (device_id, time.time()),
+                    (device_id, now),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO device_contrib_v2 (device_id, payload, daily_cap, ts) "
+                    "VALUES (?, ?, ?, ?)",
+                    (device_id, json.dumps(dev_stats), int(daily_cap), now),
                 )
             conn.commit()
             conn.close()
     except Exception:
         pass
+
     _redis_cmd("SET", "cc:v2:community_pool", json.dumps(encrypted_snapshot))
 
 
-def _check_all_limits_pipelined(device_id: Optional[str], ip_hash: str, is_pro: bool) -> str:
-    """Checks burst (10/min), daily device cap (10 Free / 150 Pro), and daily IP cap in 1 Redis RTT."""
+def _get_device_quota(device_id: Optional[str]) -> tuple:
+    """Returns (is_pro, daily_limit) for a device."""
+    try:
+        free_limit = int(os.environ.get("DAILY_FREE_LIMIT", "10"))
+        default_pro = int(os.environ.get("DAILY_PRO_LIMIT", "150"))
+    except ValueError:
+        free_limit, default_pro = 10, 150
+
+    if not device_id:
+        return (False, free_limit)
+
+    with _COMMUNITY_LOCK:
+        if device_id in _PRO_DEVICE_CAPS:
+            return (True, max(default_pro, int(_PRO_DEVICE_CAPS[device_id])))
+        if device_id in _PRO_DEVICES:
+            return (True, default_pro)
+    return (False, free_limit)
+
+
+def _check_all_limits_pipelined(
+    device_id: Optional[str],
+    ip_hash: str,
+    is_pro: bool,
+    dev_limit: Optional[int] = None,
+) -> str:
+    """Checks burst (10/min), daily device cap (10 Free / 150-750 Pro), and daily IP cap in 1 Redis RTT."""
     ident = device_id or ip_hash
     if not ident:
         return "ok"
 
     try:
         max_rpm = int(os.environ.get("BURST_RPM_LIMIT", "10"))
-        dev_limit = int(os.environ.get("DAILY_PRO_LIMIT", "150") if is_pro else os.environ.get("DAILY_FREE_LIMIT", "10"))
-        ip_limit = int(os.environ.get("DAILY_IP_LIMIT", "120"))
+        fallback_dev = int(os.environ.get("DAILY_PRO_LIMIT", "150") if is_pro else os.environ.get("DAILY_FREE_LIMIT", "10"))
+        effective_dev_limit = int(dev_limit) if dev_limit is not None else fallback_dev
+        base_ip_limit = int(os.environ.get("DAILY_IP_LIMIT", "120"))
     except ValueError:
-        max_rpm, dev_limit, ip_limit = 10, (150 if is_pro else 10), 120
+        max_rpm = 10
+        effective_dev_limit = dev_limit if dev_limit is not None else (150 if is_pro else 10)
+        base_ip_limit = 120
+
+    # Never let the base IP cap cut off a Pro contributor below their earned daily tier
+    effective_ip_limit = max(base_ip_limit, effective_dev_limit) if is_pro else base_ip_limit
 
     if _redis_cfg()[0]:
         minute_bucket = int(time.time() // 60)
@@ -504,11 +649,11 @@ def _check_all_limits_pipelined(device_id: Optional[str], ip_hash: str, is_pro: 
                 return "burst"
             if "dev" in slots:
                 d_cnt = results[slots["dev"]]
-                if isinstance(d_cnt, int) and d_cnt > dev_limit:
+                if isinstance(d_cnt, int) and d_cnt > effective_dev_limit:
                     return "quota"
             if "ip" in slots:
                 i_cnt = results[slots["ip"]]
-                if isinstance(i_cnt, int) and i_cnt > ip_limit:
+                if isinstance(i_cnt, int) and i_cnt > effective_ip_limit:
                     return "quota"
         return "ok"
 
@@ -560,7 +705,9 @@ def _get_cloudflare_cfg():
 
 
 def parse_user_keys(raw_user_keys: Optional[str]):
-    cleaned_raw = re.sub(r"\b(?:bearer|api_key|key)\s*[:=]?\s*", "", raw_user_keys or "", flags=re.I)
+    cleaned_raw = re.sub(r"^\s*share\s*:\s*", "", raw_user_keys or "", flags=re.I)
+    cleaned_raw = cleaned_raw.replace("<", " ").replace(">", " ")
+    cleaned_raw = re.sub(r"\b(?:bearer|api_key|key)\s*[:=]?\s*", "", cleaned_raw, flags=re.I)
     return [
         key.strip().strip('"').strip("'")
         for key in re.split(r"[\s,;]+", cleaned_raw)
@@ -617,6 +764,11 @@ class ContributeKeyRequest(BaseModel):
     device_id: Optional[str] = None
 
 
+class ContributeKeysRequest(BaseModel):
+    api_keys: List[str]
+    device_id: Optional[str] = None
+
+
 def _get_client(api_key: str):
     client = _GEMINI_CLIENTS.get(api_key)
     if client is None:
@@ -627,6 +779,154 @@ def _get_client(api_key: str):
                 client = genai.Client(api_key=api_key, http_options={"timeout": 20000})
                 _GEMINI_CLIENTS[api_key] = client
     return client
+
+
+# --- Zero-Token Concurrent Key Verification for Community Pool ---
+def _verify_single_pool_key(raw_key: str) -> dict:
+    prov, clean_key = detect_key_provider(raw_key)
+    if prov not in _COMMUNITY_KEYS or len(clean_key) < 12:
+        return {"valid": False, "provider": prov, "clean_key": "", "reason": "unsupported_prefix"}
+
+    probes = {
+        "groq": ("https://api.groq.com/openai/v1/models", {"Authorization": f"Bearer {clean_key}"}),
+        "gemini": ("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1", {"x-goog-api-key": clean_key}),
+        "nvidia": ("https://integrate.api.nvidia.com/v1/models", {"Authorization": f"Bearer {clean_key}"}),
+        "openrouter": ("https://openrouter.ai/api/v1/auth/key", {"Authorization": f"Bearer {clean_key}"}),
+    }
+    url, headers = probes[prov]
+
+    try:
+        r = _HTTP_CLIENT.get(url, headers=headers, timeout=6.0)
+        if r.status_code in (200, 429):
+            return {"valid": True, "provider": prov, "clean_key": clean_key, "reason": "ok"}
+        return {"valid": False, "provider": prov, "clean_key": clean_key, "reason": f"HTTP {r.status_code}"}
+    except Exception as exc:
+        return {"valid": False, "provider": prov, "clean_key": clean_key, "reason": str(exc)[:60]}
+
+
+def _process_key_contributions(raw_entries: List[str], device_id: Optional[str], request: Request) -> dict:
+    dev_id = (device_id or "").strip()[:80]
+    ip_hash = _get_client_ip_hash(request)
+    if _check_all_limits_pipelined(dev_id or None, ip_hash, is_pro=True, dev_limit=999) == "burst":
+        return {"ok": False, "message": "Too many attempts — wait 1 minute"}
+
+    # Flatten, clean, deduplicate within batch, cap at 10 keys per request
+    cleaned = []
+    seen_batch = set()
+    for entry in (raw_entries or []):
+        for k in parse_user_keys(entry):
+            if len(k) > 10 and k not in seen_batch:
+                seen_batch.add(k)
+                cleaned.append(k)
+                if len(cleaned) >= 10:
+                    break
+        if len(cleaned) >= 10:
+            break
+
+    if not cleaned:
+        return {
+            "ok": False,
+            "message": "Use Share:<KEY1,KEY2,...> with Groq, Gemini, NVIDIA, or OpenRouter keys",
+        }
+
+    # Verify all submitted keys concurrently on the shared thread pool
+    futures = [_HEDGE_POOL.submit(_verify_single_pool_key, k) for k in cleaned]
+    verifications = []
+    for fut in futures:
+        try:
+            verifications.append(fut.result(timeout=9.0))
+        except Exception:
+            verifications.append({"valid": False, "provider": "", "clean_key": "", "reason": "timeout"})
+
+    added_records = []
+    added_providers = []
+    skipped_dupes = 0
+    invalid_count = 0
+
+    with _COMMUNITY_LOCK:
+        dev_stats = (
+            _DEVICE_CONTRIBUTIONS.setdefault(dev_id, {"fingerprints": [], "providers": []})
+            if dev_id
+            else {"fingerprints": [], "providers": []}
+        )
+
+        for res in verifications:
+            if not res or not res.get("valid"):
+                invalid_count += 1
+                continue
+
+            prov = res["provider"]
+            clean_k = res["clean_key"]
+            fp = _key_fingerprint(prov, clean_k)
+
+            # Global SHA-256 anti-spam deduplication
+            if fp in _KEY_FINGERPRINTS:
+                skipped_dupes += 1
+                continue
+
+            _KEY_FINGERPRINTS.add(fp)
+            if clean_k not in _COMMUNITY_KEYS[prov]:
+                _COMMUNITY_KEYS[prov].append(clean_k)
+
+            added_records.append((prov, clean_k, fp))
+            added_providers.append(prov)
+
+            if dev_id:
+                if fp not in dev_stats["fingerprints"]:
+                    dev_stats["fingerprints"].append(fp)
+                if prov not in dev_stats["providers"]:
+                    dev_stats["providers"].append(prov)
+
+        total_dev_keys = len(dev_stats["fingerprints"]) if dev_id else len(added_records)
+        distinct_providers = len(dev_stats["providers"]) if dev_id else len(set(added_providers))
+
+        if total_dev_keys == 0:
+            if skipped_dupes > 0 and invalid_count == 0:
+                return {
+                    "ok": False,
+                    "added_count": 0,
+                    "skipped_duplicates": skipped_dupes,
+                    "invalid_count": 0,
+                    "message": "Key already in pool — share a fresh free key",
+                }
+            return {
+                "ok": False,
+                "added_count": 0,
+                "skipped_duplicates": skipped_dupes,
+                "invalid_count": invalid_count,
+                "message": f"0/{len(cleaned)} keys verified — check key prefixes",
+            }
+
+        daily_cap = _tier_limit_for_contributions(total_dev_keys, distinct_providers)
+        if dev_id:
+            _PRO_DEVICES.add(dev_id)
+            _PRO_DEVICE_CAPS[dev_id] = max(_PRO_DEVICE_CAPS.get(dev_id, 0), daily_cap)
+            daily_cap = _PRO_DEVICE_CAPS[dev_id]
+        snapshot_stats = {
+            "fingerprints": list(dev_stats["fingerprints"]),
+            "providers": list(dev_stats["providers"]),
+        }
+
+    if added_records or dev_id:
+        _persist_community_batch(added_records, dev_id, daily_cap, snapshot_stats)
+
+    if added_providers:
+        prov_label = ", ".join(sorted(set(added_providers)))
+        msg = f"Added {len(added_providers)}/{len(cleaned)} ({prov_label}) · {daily_cap}/day Pro"
+    else:
+        msg = f"Already in pool · {daily_cap}/day Pro active"
+
+    return {
+        "ok": True,
+        "tier": "PRO",
+        "added_count": len(added_providers),
+        "total_device_keys": total_dev_keys,
+        "distinct_providers": distinct_providers,
+        "skipped_duplicates": skipped_dupes,
+        "invalid_count": invalid_count,
+        "daily_limit": daily_cap,
+        "message": msg,
+    }
 
 
 # --- Full 5-Provider Self-Healing Live Model Auto-Discovery ---
@@ -680,7 +980,8 @@ def _discover_gemini_models(api_key: str) -> list:
         return cached[1]
     try:
         r = _HTTP_CLIENT.get(
-            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}&pageSize=100"
+            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100",
+            headers={"x-goog-api-key": api_key},
         )
         if r.status_code != 200:
             return []
@@ -759,9 +1060,12 @@ def health():
     with _COMMUNITY_LOCK:
         community_total = sum(len(v) for v in _COMMUNITY_KEYS.values())
         pro_count = len(_PRO_DEVICES)
+    with _CACHE_LOCK:
+        cached_count = len(IMAGE_CACHE) + len(QUIZ_CACHE)
+        cooldown_count = sum(1 for exp in KEY_COOLDOWN.values() if exp > now)
     return {
         "status": "ok",
-        "engine": "v7.2.0-selfheal",
+        "engine": "v7.3.0-selfheal",
         "groq_keys": len(get_pool_keys("groq")),
         "gemini_keys": len(get_pool_keys("gemini")),
         "cloudflare_keys": len(cf_keys) if cf_status == "ok" else 0,
@@ -772,15 +1076,15 @@ def health():
         "pro_devices": pro_count,
         "persistent_cache": bool(_redis_cfg()[0]),
         "admin_protected": bool(os.environ.get("ADMIN_SECRET", "").strip()),
-        "cached_items": len(IMAGE_CACHE) + len(QUIZ_CACHE),
-        "active_cooldowns": sum(1 for exp in KEY_COOLDOWN.values() if exp > now),
+        "cached_items": cached_count,
+        "active_cooldowns": cooldown_count,
     }
 
 
 @app.get("/v3_1/config")
 def remote_client_config():
     return {
-        "latest_version": os.environ.get("APP_LATEST_VERSION", "3.1.0").strip(),
+        "latest_version": os.environ.get("APP_LATEST_VERSION", "3.1.1").strip(),
         "release_url": os.environ.get(
             "APP_RELEASE_URL",
             "https://github.com/burhanuddinkhandwala786/cursor-companion/releases/latest",
@@ -979,50 +1283,12 @@ def self_test(request: Request, secret: Optional[str] = Query(default=None)):
 
 @app.post("/v3_1/contribute-key")
 def contribute_community_key(req: ContributeKeyRequest, request: Request):
-    ip_hash = _get_client_ip_hash(request)
-    if _check_all_limits_pipelined(req.device_id, ip_hash, is_pro=True) == "burst":
-        return {"ok": False, "message": "Too many attempts — wait 1 minute"}
+    return _process_key_contributions([req.api_key], req.device_id, request)
 
-    keys = parse_user_keys(req.api_key)
-    if not keys:
-        return {"ok": False, "message": "Invalid key format"}
 
-    prov, clean_key = detect_key_provider(keys[0])
-    if prov not in _COMMUNITY_KEYS:
-        return {"ok": False, "message": "Contribute a free Groq (gsk_), Gemini (AIza), NVIDIA (nvapi-), or OpenRouter (sk-or-) key"}
-
-    try:
-        if prov == "gemini":
-            client = _get_client(clean_key)
-            check_model = _get_live_or_default("gemini:live", GEMINI_FAST_MODELS)[0]
-            client.models.generate_content(
-                model=check_model,
-                contents="Reply OK",
-                config=types.GenerateContentConfig(max_output_tokens=16),
-            )
-        else:
-            meta = PROVIDER_META[prov]
-            check_model = _get_live_or_default(f"{prov}:txt", meta["text"])[0]
-            body = {"model": check_model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 24}
-            if prov == "groq" and "gpt-oss" in check_model:
-                body["reasoning_effort"] = "low"
-            r = _HTTP_CLIENT.post(
-                meta["chat_url"],
-                json=body,
-                headers={"Authorization": f"Bearer {clean_key}", "Content-Type": "application/json"},
-            )
-            if r.status_code not in (200, 429):
-                return {"ok": False, "message": f"Key verification failed (HTTP {r.status_code})"}
-    except Exception as exc:
-        return {"ok": False, "message": f"Key check failed: {str(exc)[:80]}"}
-
-    _persist_community_pool(prov, clean_key, req.device_id or "")
-    return {
-        "ok": True,
-        "provider": prov,
-        "tier": "PRO",
-        "message": f"Pro Pool Unlocked ({prov.upper()} contributed ✓)",
-    }
+@app.post("/v3_1/contribute-keys")
+def contribute_multiple_keys(req: ContributeKeysRequest, request: Request):
+    return _process_key_contributions(req.api_keys, req.device_id, request)
 
 
 def extract_json(raw_text: str, preserve_notes: bool = False) -> dict:
@@ -1196,10 +1462,10 @@ def call_gemini_keys(
         for api_key in ordered_keys:
             if attempts >= max_attempts:
                 break
-            if KEY_COOLDOWN.get(api_key, 0) > now:
+            if _is_cooling_down(api_key, now):
                 continue
             model_cd_key = f"{api_key}:{model_name}"
-            if KEY_COOLDOWN.get(model_cd_key, 0) > now:
+            if _is_cooling_down(model_cd_key, now):
                 continue
 
             attempts += 1
@@ -1213,13 +1479,13 @@ def call_gemini_keys(
                 err_type = _classify_gemini_error(error_text)
 
                 if err_type == "overload":
-                    KEY_COOLDOWN[model_cd_key] = time.time() + 60
+                    _set_cooldown(model_cd_key, 60)
                 elif err_type == "rate_limit":
-                    KEY_COOLDOWN[model_cd_key] = time.time() + 25
+                    _set_cooldown(model_cd_key, 25)
                 elif err_type == "forbidden":
-                    KEY_COOLDOWN[api_key] = time.time() + 3600
+                    _set_cooldown(api_key, 3600)
                 elif err_type == "model_unavailable":
-                    KEY_COOLDOWN[model_cd_key] = time.time() + 21600
+                    _set_cooldown(model_cd_key, 21600)
                     if not discovered_now:
                         discovered_now = True
                         added = 0
@@ -1232,7 +1498,7 @@ def call_gemini_keys(
         if attempts >= max_attempts:
             break
 
-    if is_byok and all(KEY_COOLDOWN.get(k, 0) > time.time() for k in keys):
+    if is_byok and all(_is_cooling_down(k) for k in keys):
         raise RuntimeError("BYOK_INVALID: Invalid personal API key (Alt+K)")
     if is_byok:
         raise RuntimeError(f"BYOK_LIMIT: {last_error}")
@@ -1266,10 +1532,10 @@ def call_openai_compat(
             continue
         tried.add(model_id)
 
-        if KEY_COOLDOWN.get(f"{provider_tag}:{api_key}", 0) > time.time():
+        if _is_cooling_down(f"{provider_tag}:{api_key}"):
             break
         cooldown_key = f"{provider_tag}:{api_key}:{model_id}:{modality}"
-        if KEY_COOLDOWN.get(cooldown_key, 0) > time.time():
+        if _is_cooling_down(cooldown_key):
             continue
 
         attempts += 1
@@ -1335,17 +1601,17 @@ def call_openai_compat(
 
         last_error = f"{provider_tag} {model_id}: HTTP {response.status_code}"
         if response.status_code in (401, 402, 403):
-            KEY_COOLDOWN[f"{provider_tag}:{api_key}"] = time.time() + (86400 if response.status_code == 402 else 3600)
+            _set_cooldown(f"{provider_tag}:{api_key}", 86400 if response.status_code == 402 else 3600)
             if is_byok:
                 raise RuntimeError("BYOK_INVALID: Key invalid or credit exhausted (Alt+K)")
             break
         if response.status_code in (429, 503, 504):
             if provider_tag == "openrouter" and "per-day" in response.text.lower():
-                KEY_COOLDOWN[f"{provider_tag}:{api_key}"] = time.time() + 21600
+                _set_cooldown(f"{provider_tag}:{api_key}", 21600)
                 break
-            KEY_COOLDOWN[cooldown_key] = time.time() + (45 if response.status_code >= 500 else 25)
+            _set_cooldown(cooldown_key, 45 if response.status_code >= 500 else 25)
         elif response.status_code in (400, 404, 410):
-            KEY_COOLDOWN[cooldown_key] = time.time() + 21600
+            _set_cooldown(cooldown_key, 21600)
             if not discovered_added and idx >= len(candidate_models):
                 discovered_added = True
                 if provider_tag == "cloudflare":
@@ -1489,10 +1755,10 @@ def _has_ready_gemini(deep: bool = False) -> bool:
     now = time.time()
     models = _get_live_or_default("gemini:live", GEMINI_DEEP_MODELS if deep else GEMINI_FAST_MODELS)
     for api_key in get_pool_keys("gemini"):
-        if KEY_COOLDOWN.get(api_key, 0) > now:
+        if _is_cooling_down(api_key, now):
             continue
         for model_name in models:
-            if KEY_COOLDOWN.get(f"{api_key}:{model_name}", 0) <= now:
+            if not _is_cooling_down(f"{api_key}:{model_name}", now):
                 return True
     return False
 
@@ -1563,7 +1829,7 @@ def _run_shared_cascade(
         done_event.set()
         wake_backup.set()
 
-    # Ordered 5-Provider Zero-Card Fallbacks (capped to 1 model per fallback so latency never snowballs)
+    # Ordered 5-Provider Zero-Card Fallbacks
     if not groq_tried:
         raw_groq = _call_compat_pool("groq", contents_text, img_b64=img_b64_str, sys_prompt=sys_prompt, max_models=2)
         if raw_groq:
@@ -1631,8 +1897,9 @@ def _unified_execute(
 
     user_keys = parse_user_keys(req.user_api_key)
     is_byok = bool(user_keys)
-    with _COMMUNITY_LOCK:
-        is_pro_pool = bool(device_id and device_id in _PRO_DEVICES and not is_byok)
+    is_pro_pool, dev_daily_cap = _get_device_quota(device_id)
+    if is_byok:
+        is_pro_pool = False
 
     txt = (req.text_content or "").strip()
     if txt.upper().startswith("TEST:") or (req.user_api_key or "").strip().lower() == "test":
@@ -1657,9 +1924,19 @@ def _unified_execute(
         contents_text = f"Context:\n{req.prior_context}\n\nFollow-up:\n{req.follow_up}"
         raw_key = f"fu:{contents_text}"
     elif req.image_base64:
-        clean_b64 = req.image_base64.split(",")[-1]
-        img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
-        # Exact MD5 only — never collides across different questions
+        try:
+            clean_b64 = req.image_base64.split(",")[-1]
+            img_pil = Image.open(BytesIO(base64.b64decode(clean_b64))).convert("RGB")
+        except Exception:
+            return {
+                "detected_type": "ERROR",
+                "cursor_pill": "Invalid image — retry scan",
+                "copy_value": "",
+                "expanded_note": "",
+                "pointer_xy": None,
+                "key_source": "BYOK" if is_byok else ("PRO" if is_pro_pool else "POOL"),
+            }
+
         raw_key = f"{mode}:img:{hashlib.md5(clean_b64.encode()).hexdigest()}"
 
         max_dim = 780 if high_res_vision else 700
@@ -1691,13 +1968,14 @@ def _unified_execute(
             "copy_value": "",
             "expanded_note": "",
             "pointer_xy": None,
-            "key_source": "BYOK" if is_byok else "POOL",
+            "key_source": "BYOK" if is_byok else ("PRO" if is_pro_pool else "POOL"),
         }
 
     cache_key = hashlib.md5(f"v13:{raw_key}".encode()).hexdigest()
 
     if not is_followup:
-        hit = IMAGE_CACHE.get(cache_key)
+        with _CACHE_LOCK:
+            hit = IMAGE_CACHE.get(cache_key)
         if hit and time.time() - hit[0] < CACHE_TTL:
             cached = dict(hit[1])
             if not preserve_notes:
@@ -1706,7 +1984,8 @@ def _unified_execute(
             return cached
 
     if not is_followup and quiz_hash:
-        q_hit = QUIZ_CACHE.get(quiz_hash)
+        with _CACHE_LOCK:
+            q_hit = QUIZ_CACHE.get(quiz_hash)
         if q_hit and (time.time() - q_hit[0] < QUIZ_CACHE_TTL):
             cached = dict(q_hit[1])
             if not preserve_notes:
@@ -1716,7 +1995,8 @@ def _unified_execute(
 
         db_hit = _db_get(quiz_hash)
         if db_hit:
-            QUIZ_CACHE[quiz_hash] = (time.time(), db_hit)
+            with _CACHE_LOCK:
+                QUIZ_CACHE[quiz_hash] = (time.time(), db_hit)
             cached = dict(db_hit)
             if not preserve_notes:
                 cached["expanded_note"] = ""
@@ -1753,7 +2033,7 @@ def _unified_execute(
                 "key_source": "BYOK",
             }
     else:
-        limit_status = _check_all_limits_pipelined(device_id, ip_hash, is_pro_pool)
+        limit_status = _check_all_limits_pipelined(device_id, ip_hash, is_pro_pool, dev_limit=dev_daily_cap)
         if limit_status == "burst":
             return {
                 "detected_type": "ERROR",
@@ -1761,16 +2041,20 @@ def _unified_execute(
                 "copy_value": "",
                 "expanded_note": "Burst protection active (10 req/min). Add your own free key in Alt+K for unlimited speed.",
                 "pointer_xy": None,
-                "key_source": "POOL",
+                "key_source": "PRO" if is_pro_pool else "POOL",
             }
         if limit_status == "quota":
             return {
                 "detected_type": "ERROR",
-                "cursor_pill": "Daily free limit reached — add free key in Alt+K",
+                "cursor_pill": (
+                    f"Daily Pro limit ({dev_daily_cap}) reached — share more keys in Alt+K"
+                    if is_pro_pool
+                    else "Daily free limit reached — add free key in Alt+K"
+                ),
                 "copy_value": "",
-                "expanded_note": "Paste your own free Groq/Gemini key in Alt+K, or type share:<KEY> to unlock 150/day Pro Pool.",
+                "expanded_note": "Paste your own free Groq/Gemini key in Alt+K, or type Share:<KEY1,KEY2,...> to unlock up to 750/day Pro Pool.",
                 "pointer_xy": None,
-                "key_source": "POOL",
+                "key_source": "PRO" if is_pro_pool else "POOL",
             }
 
         raw_json = _run_shared_cascade(
@@ -1787,14 +2071,17 @@ def _unified_execute(
     result["key_source"] = "BYOK" if is_byok else ("PRO" if is_pro_pool else "POOL")
 
     if not re.search(r"unclear crop", result.get("cursor_pill", ""), re.I):
-        IMAGE_CACHE[cache_key] = (time.time(), dict(result))
-        if len(IMAGE_CACHE) > 600:
-            IMAGE_CACHE.pop(next(iter(IMAGE_CACHE)))
+        now = time.time()
+        with _CACHE_LOCK:
+            IMAGE_CACHE[cache_key] = (now, dict(result))
+            if len(IMAGE_CACHE) > 600:
+                IMAGE_CACHE.pop(next(iter(IMAGE_CACHE)), None)
 
+            if not is_followup and quiz_hash and confidence == "high":
+                QUIZ_CACHE[quiz_hash] = (now, dict(result))
+                if len(QUIZ_CACHE) > 900:
+                    QUIZ_CACHE.pop(next(iter(QUIZ_CACHE)), None)
         if not is_followup and quiz_hash and confidence == "high":
-            QUIZ_CACHE[quiz_hash] = (time.time(), dict(result))
-            if len(QUIZ_CACHE) > 900:
-                QUIZ_CACHE.pop(next(iter(QUIZ_CACHE)))
             _HEDGE_POOL.submit(_db_put, quiz_hash, dict(result))
 
     if not preserve_notes and result.get("detected_type") in ("MCQ", "DIRECT_VALUE", "CODE_FIX"):
