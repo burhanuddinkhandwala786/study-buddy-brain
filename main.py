@@ -31,9 +31,9 @@ app = FastAPI(title="Cursor Companion Brain", version="7.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://burhanuddinkhandwala786.github.io/cursor-companion/"],
+    allow_origins=["*"],
     allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Device-ID", "X-Admin-Secret"],
+    allow_headers=["*"],
 )
 
 
