@@ -195,47 +195,19 @@ PROVIDER_META = {
     },
 }
 
-PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
-Accuracy is #1. You MUST fill the "verification" field FIRST before choosing "cursor_pill":
-1. Focus ONLY on the primary/centered question.
-2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
-3. Independently verify the factual or mathematical answer BEFORE looking at any highlighted/selected radio buttons.
-4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option.
-5. Only if the question stem or options are physically cut off or illegible, return cursor_pill "Unclear crop — retry".
+PROMPT = """Verify accurately before answering. Focus on the primary question. Check negations (NOT/EXCEPT), units, and compound options (both A&B, all of the above). Ignore pre-selected radios. If cut off/illegible, cursor_pill="Unclear crop — retry".
+Return ONLY raw JSON:
+{"verification":"brief check","detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"exact option or answer","copy_value":"raw value or empty for MCQ","expanded_note":"","pointer_xy":null}"""
 
-Return ONLY valid JSON:
-{"verification":"concise step-by-step check","detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"","pointer_xy":null}
+V3_SOLVE_PROMPT = """Verify accurately before answering. Focus on the primary question. Check negations (NOT/EXCEPT), units, and compound options (both A&B, all of the above). Ignore pre-selected radios. If cut off/illegible, cursor_pill="Unclear crop — retry", confidence="low".
+Return ONLY raw JSON:
+{"verification":"brief check","detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"exact option letter+text or answer","copy_value":"raw value or empty for MCQ","expanded_note":"1 short sentence","confidence":"high"|"medium","pointer_xy":null}"""
 
-Strict Output Rules:
-- IF ANY OPTIONS (A/B/C/D/E or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "B. steel" or "D. both b and c"), copy_value="", expanded_note="".
-- DIRECT_VALUE / CODE_FIX (no options present): cursor_pill = concise verified answer or fixed code line; copy_value = raw answer; expanded_note="".
-- CONCEPT_EXPLAIN (only when user explicitly asks "explain" or "why" in follow-up): cursor_pill = 1-line summary; expanded_note = 2 short bullet points."""
+V3_REWRITE_PROMPT = """Rewrite clearly and politely, keeping exact meaning. Return ONLY raw JSON:
+{"verification":"ok","detected_type":"REWRITE","cursor_pill":"1-line preview (max 65 chars)","copy_value":"full rewrite","expanded_note":"brief tone note","confidence":"high","pointer_xy":null}"""
 
-V3_SOLVE_PROMPT = """You are an elite academic, competitive-exam, and engineering verification engine.
-Accuracy is #1. You MUST fill the "verification" field FIRST before choosing "cursor_pill":
-1. Focus ONLY on the primary/centered question.
-2. Read the ENTIRE question carefully (watch for NOT, INCORRECT, EXCEPT, and unit conversions).
-3. Independently verify the factual or mathematical answer BEFORE looking at any highlighted/selected radio buttons.
-4. COMPOUND OPTIONS CHECK: Read ALL options (A/B/C/D/E) before answering. If two individual options are true and a combined option exists ("both A and B", "both B and C", "all of the above", "none of the above"), you MUST select the combined option.
-5. Only if the question stem or options are physically cut off or illegible, return cursor_pill "Unclear crop — retry" and confidence "low".
-
-Return ONLY valid JSON:
-{"verification":"concise step-by-step check","detected_type":"MCQ"|"DIRECT_VALUE"|"CODE_FIX"|"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high"|"medium","pointer_xy":null}
-
-Strict Output Rules:
-- IF ANY OPTIONS (A/B/C/D/E or 1/2/3/4) ARE PRESENT: detected_type="MCQ", cursor_pill = exact option letter + text (e.g. "B. steel"), copy_value="", expanded_note = 1 short sentence explaining why.
-- DIRECT_VALUE / CODE_FIX: cursor_pill = exact concise answer; copy_value = raw answer; expanded_note = 1 short sentence.
-- CONCEPT_EXPLAIN: cursor_pill = 1-line takeaway; copy_value = same takeaway; expanded_note = 3 short bullet points."""
-
-V3_REWRITE_PROMPT = """Rewrite the provided text clearly and politely.
-Output ONLY a single raw JSON object:
-{"verification":"tone checked","detected_type":"REWRITE","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
-Rules: cursor_pill = 1-line preview (max 65 chars); copy_value = complete rewritten text; expanded_note = brief tone note."""
-
-V3_EXPLAIN_PROMPT = """Explain the provided concept, code, or error clearly in plain English.
-Output ONLY a single raw JSON object:
-{"verification":"facts checked","detected_type":"CONCEPT_EXPLAIN","cursor_pill":"...","copy_value":"...","expanded_note":"...","confidence":"high","pointer_xy":null}
-Rules: cursor_pill = 1-line takeaway (max 70 chars); copy_value = same takeaway; expanded_note = 3 short bullet points."""
+V3_EXPLAIN_PROMPT = """Explain clearly in plain English. Return ONLY raw JSON:
+{"verification":"ok","detected_type":"CONCEPT_EXPLAIN","cursor_pill":"1-line takeaway (max 70 chars)","copy_value":"same takeaway","expanded_note":"3 short bullets","confidence":"high","pointer_xy":null}"""
 
 
 # --- Authenticated Encryption at Rest (Stdlib Encrypt-then-MAC, Zero Extra Deps) ---
@@ -1084,7 +1056,7 @@ def health():
 @app.get("/v3_1/config")
 def remote_client_config():
     return {
-        "latest_version": os.environ.get("APP_LATEST_VERSION", "3.1.1").strip(),
+        "latest_version": os.environ.get("APP_LATEST_VERSION", "3.1.3").strip(),
         "release_url": os.environ.get(
             "APP_RELEASE_URL",
             "https://github.com/burhanuddinkhandwala786/cursor-companion/releases/latest",
@@ -1394,7 +1366,7 @@ def _try_one_gemini(
 ) -> str:
     cfg_kwargs = {
         "response_mime_type": "application/json",
-        "max_output_tokens": 900,
+        "max_output_tokens": 400,
     }
     if use_thinking:
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
@@ -1563,7 +1535,7 @@ def call_openai_compat(
             "model": model_id,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 900,
+            "max_tokens": 400,
         }
         if provider_tag == "groq" and "gpt-oss" in model_id:
             payload_body["reasoning_effort"] = "low"
@@ -1795,7 +1767,7 @@ def _run_shared_cascade(
                 raise
 
         def _gemini_backup():
-            wake_backup.wait(1.2)
+            wake_backup.wait(3.2)
             if done_event.is_set():
                 raise RuntimeError("Cancelled")
             res = call_gemini_keys(
